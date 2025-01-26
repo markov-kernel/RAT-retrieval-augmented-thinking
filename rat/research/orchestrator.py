@@ -135,9 +135,8 @@ class ResearchOrchestrator:
                 logger.debug("Terminate decision found in reason_decisions, skipping other agents.")
             else:
                 search_decisions = self.search_agent.analyze(self.current_context)
-                explore_decisions = self.explore_agent.analyze(self.current_context)
-                
-                all_decisions = reason_decisions + search_decisions + explore_decisions
+                # ExploreAgent no longer produces decisions, so we skip calling explore_agent.analyze()
+                all_decisions = reason_decisions + search_decisions
             
             decisions_by_type = {
                 DecisionType.SEARCH: [],

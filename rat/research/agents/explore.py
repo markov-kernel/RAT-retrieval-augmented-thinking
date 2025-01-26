@@ -82,96 +82,11 @@ class ExploreAgent(BaseAgent):
         
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
         """
-        Look at search results, generate decisions to explore unvisited URLs.
-        Groups URLs by domain for efficient parallel processing.
+        No longer evaluates URLs from search results.
+        URL evaluation is now handled by ReasoningAgent.
+        Returns empty list since ReasoningAgent will create EXPLORE decisions.
         """
-        decisions = []
-        
-        # Get search results with potential URLs
-        search_results = context.get_content("main", ContentType.SEARCH_RESULT)
-        
-        # Check if we've hit our URL limit
-        with self._url_lock:
-            if len(self.explored_urls) >= self.max_urls:
-                rprint("[yellow]ExploreAgent: Reached maximum URL limit[/yellow]")
-                return decisions
-        
-        # Group URLs by domain for parallel processing
-        domain_urls: Dict[str, List[Dict[str, Any]]] = {}
-        
-        # Process each search result
-        for result in search_results:
-            if not isinstance(result.content, dict):
-                continue
-                
-            urls = result.content.get("urls", [])
-            query_id = result.content.get("query_id")
-            
-            for url in urls:
-                # Basic validation
-                if not self._is_valid_url(url):
-                    continue
-                    
-                with self._url_lock:
-                    if url in self.explored_urls:
-                        continue
-                
-                # Group by domain
-                domain = urlparse(url).netloc.lower()
-                if domain not in domain_urls:
-                    domain_urls[domain] = []
-                
-                priority = result.priority * 0.8
-                if priority >= self.min_priority:
-                    domain_urls[domain].append({
-                        "url": url,
-                        "priority": priority,
-                        "query_id": query_id,
-                        "rationale": f"URL found in search results: {url}"
-                    })
-        
-        # Create decisions for each domain's URLs
-        for domain, urls in domain_urls.items():
-            # Sort URLs by priority within each domain
-            urls.sort(key=lambda x: x["priority"], reverse=True)
-            
-            # If we have enough URLs for this domain, use batch scraping
-            if len(urls) >= self.use_batch_scrape_threshold:
-                # Take top N URLs for batch processing
-                batch_urls = urls[:self.max_urls_per_batch]
-                decisions.append(
-                    ResearchDecision(
-                        decision_type=DecisionType.EXPLORE,
-                        priority=max(u["priority"] for u in batch_urls),
-                        context={
-                            "urls": [u["url"] for u in batch_urls],
-                            "source_query_ids": [u["query_id"] for u in batch_urls],
-                            "rationale": f"Batch scraping {len(batch_urls)} URLs from domain {domain}",
-                            "domain": domain,
-                            "is_batch": True
-                        },
-                        rationale=f"Batch exploration of domain {domain}"
-                    )
-                )
-            else:
-                # Otherwise use single-page scraping for each URL
-                for url_info in urls[:self.max_parallel_domains]:
-                    decisions.append(
-                        ResearchDecision(
-                            decision_type=DecisionType.EXPLORE,
-                            priority=url_info["priority"],
-                            context={
-                                "url": url_info["url"],
-                                "source_query_id": url_info["query_id"],
-                                "rationale": url_info["rationale"],
-                                "domain": domain,
-                                "is_batch": False
-                            },
-                            rationale=f"Single-page exploration: {url_info['url']}"
-                        )
-                    )
-        
-        return decisions
+        return []
         
     def can_handle(self, decision: ResearchDecision) -> bool:
         """

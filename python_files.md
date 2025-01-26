@@ -708,96 +708,11 @@ class ExploreAgent(BaseAgent):
         
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
         """
-        Look at search results, generate decisions to explore unvisited URLs.
-        Groups URLs by domain for efficient parallel processing.
+        No longer evaluates URLs from search results.
+        URL evaluation is now handled by ReasoningAgent.
+        Returns empty list since ReasoningAgent will create EXPLORE decisions.
         """
-        decisions = []
-        
-        # Get search results with potential URLs
-        search_results = context.get_content("main", ContentType.SEARCH_RESULT)
-        
-        # Check if we've hit our URL limit
-        with self._url_lock:
-            if len(self.explored_urls) >= self.max_urls:
-                rprint("[yellow]ExploreAgent: Reached maximum URL limit[/yellow]")
-                return decisions
-        
-        # Group URLs by domain for parallel processing
-        domain_urls: Dict[str, List[Dict[str, Any]]] = {}
-        
-        # Process each search result
-        for result in search_results:
-            if not isinstance(result.content, dict):
-                continue
-                
-            urls = result.content.get("urls", [])
-            query_id = result.content.get("query_id")
-            
-            for url in urls:
-                # Basic validation
-                if not self._is_valid_url(url):
-                    continue
-                    
-                with self._url_lock:
-                    if url in self.explored_urls:
-                        continue
-                
-                # Group by domain
-                domain = urlparse(url).netloc.lower()
-                if domain not in domain_urls:
-                    domain_urls[domain] = []
-                
-                priority = result.priority * 0.8
-                if priority >= self.min_priority:
-                    domain_urls[domain].append({
-                        "url": url,
-                        "priority": priority,
-                        "query_id": query_id,
-                        "rationale": f"URL found in search results: {url}"
-                    })
-        
-        # Create decisions for each domain's URLs
-        for domain, urls in domain_urls.items():
-            # Sort URLs by priority within each domain
-            urls.sort(key=lambda x: x["priority"], reverse=True)
-            
-            # If we have enough URLs for this domain, use batch scraping
-            if len(urls) >= self.use_batch_scrape_threshold:
-                # Take top N URLs for batch processing
-                batch_urls = urls[:self.max_urls_per_batch]
-                decisions.append(
-                    ResearchDecision(
-                        decision_type=DecisionType.EXPLORE,
-                        priority=max(u["priority"] for u in batch_urls),
-                        context={
-                            "urls": [u["url"] for u in batch_urls],
-                            "source_query_ids": [u["query_id"] for u in batch_urls],
-                            "rationale": f"Batch scraping {len(batch_urls)} URLs from domain {domain}",
-                            "domain": domain,
-                            "is_batch": True
-                        },
-                        rationale=f"Batch exploration of domain {domain}"
-                    )
-                )
-            else:
-                # Otherwise use single-page scraping for each URL
-                for url_info in urls[:self.max_parallel_domains]:
-                    decisions.append(
-                        ResearchDecision(
-                            decision_type=DecisionType.EXPLORE,
-                            priority=url_info["priority"],
-                            context={
-                                "url": url_info["url"],
-                                "source_query_id": url_info["query_id"],
-                                "rationale": url_info["rationale"],
-                                "domain": domain,
-                                "is_batch": False
-                            },
-                            rationale=f"Single-page exploration: {url_info['url']}"
-                        )
-                    )
-        
-        return decisions
+        return []
         
     def can_handle(self, decision: ResearchDecision) -> bool:
         """
@@ -1030,7 +945,7 @@ Supports parallel processing of content analysis and decision making.
 
 Enhancement:
 1. We still instruct deepseek-reasoner to produce JSON, but it may be malformed.
-2. We do a "second pass" with deepseek-chat if parsing fails, passing `response_format={'type':'json_object'}` to obtain valid JSON.
+2. We do a "second pass" with gpt-4o-mini if parsing fails, passing the raw text to fix into valid JSON.
 3. This preserves all existing flows while guaranteeing structured JSON where needed.
 """
 
@@ -1043,6 +958,7 @@ from rich import print as rprint
 from openai import OpenAI
 import os
 import logging
+from urllib.parse import urlparse
 
 from .base import BaseAgent, ResearchDecision, DecisionType
 from .context import ResearchContext, ContentType, ContentItem
@@ -1064,8 +980,7 @@ class ReasoningAgent(BaseAgent):
     Also drives the research forward (search, explore, or terminate).
 
     - We instruct the deepseek-reasoner to produce JSON, then attempt to parse it.
-    - If parsing fails, we call deepseek-chat with response_format={'type':'json_object'}
-      to repair/morph the text into valid JSON.
+    - If parsing fails, we call gpt-4o-mini to repair/morph the text into valid JSON.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -1077,11 +992,10 @@ class ReasoningAgent(BaseAgent):
             base_url="https://api.deepseek.com"
         )
 
-        # Secondary client for deepseek-chat calls (to fix malformed JSON)
-        # You can reuse the same DEEPSEEK_API_KEY or have a separate one.
-        self.deepseek_chat = OpenAI(
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com"
+        # Secondary client for gpt-4o-mini calls (to fix malformed JSON)
+        self.gpt4omini = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),  # Using standard OpenAI API key
+            base_url="https://api.openai.com/v1"     # Standard OpenAI endpoint
         )
         
         self.max_parallel_tasks = self.config.get("max_parallel_tasks", 3)
@@ -1121,17 +1035,42 @@ class ReasoningAgent(BaseAgent):
                 )
             return decisions
         
-        # Identify unprocessed search or explored content
+        # Identify unprocessed search results for URL evaluation
         unprocessed_search = [
             item for item in search_results
-            if not item.metadata.get("analyzed_by_reasoner")
+            if not item.metadata.get("analyzed_for_explore")
         ]
+        
+        # Mark them as processed
+        for item in unprocessed_search:
+            item.metadata["analyzed_for_explore"] = True
+
+        # Gather candidate URLs from unprocessed search results
+        candidate_urls = []
+        for item in unprocessed_search:
+            if isinstance(item.content, dict):
+                urls = item.content.get("urls", [])
+                for url in urls:
+                    candidate_urls.append(url)
+            elif isinstance(item.content, str):
+                # Handle case where content is a string with URLs in metadata
+                urls = item.metadata.get("urls", [])
+                for url in urls:
+                    candidate_urls.append(url)
+
+        # Ask DeepSeek which URLs are worth exploring
+        if candidate_urls:
+            explore_decisions = self._decide_which_urls_to_explore(candidate_urls)
+            decisions.extend(explore_decisions)
+
+        # Continue with existing logic for analyzing content
         explored_content = context.get_content("main", ContentType.EXPLORED_CONTENT)
         unprocessed_explored = [
             item for item in explored_content
             if not item.metadata.get("analyzed_by_reasoner")
         ]
-        
+
+        # Process unprocessed content
         for item in unprocessed_search + unprocessed_explored:
             if item.priority < self.min_priority:
                 continue
@@ -1238,7 +1177,7 @@ class ReasoningAgent(BaseAgent):
                 raise ValueError(msg)
             
             # Instruct deepseek-reasoner to produce JSON in the analysis
-            # (Might be malformed; we will fix it with deepseek-chat if needed.)
+            # (Might be malformed; we will fix it with gpt-4o-mini if needed.)
             single_result = self._analyze_content_chunk(content, content_type)
             success = bool(single_result.get("analysis"))
 
@@ -1366,8 +1305,8 @@ class ReasoningAgent(BaseAgent):
                         "content_type": content_type
                     }
                 except json.JSONDecodeError:
-                    # If JSON is malformed, try to fix it with deepseek-chat
-                    fixed_json = self._transform_malformed_json_with_chat(result_text)
+                    # If JSON is malformed, try to fix it with gpt-4o-mini
+                    fixed_json = self._transform_malformed_json_with_gpt4omini(result_text)
                     result_json = json.loads(fixed_json)
                     return {
                         **result_json,
@@ -1435,8 +1374,8 @@ class ReasoningAgent(BaseAgent):
                     "metadata": metadata
                 }
             except json.JSONDecodeError:
-                # If JSON is malformed, try to fix it with deepseek-chat
-                fixed_json = self._transform_malformed_json_with_chat(result_text)
+                # If JSON is malformed, try to fix it with gpt-4o-mini
+                fixed_json = self._transform_malformed_json_with_gpt4omini(result_text)
                 result_json = json.loads(fixed_json)
                 return {
                     **result_json,
@@ -1453,12 +1392,17 @@ class ReasoningAgent(BaseAgent):
                 "url": url
             }
 
-    def _transform_malformed_json_with_chat(self, possibly_malformed: str) -> str:
+    def _transform_malformed_json_with_gpt4omini(self, possibly_malformed: str) -> str:
         """
-        Call deepseek-chat to fix malformed JSON text.
+        Call gpt-4o-mini to fix malformed JSON text.
         Returns the corrected JSON string or "[]" if it cannot repair it.
         """
+        if not possibly_malformed or not possibly_malformed.strip():
+            logger.warning("Empty input to _transform_malformed_json_with_gpt4omini")
+            return "[]"
+            
         try:
+            logger.debug("Attempting to fix malformed JSON: %s", possibly_malformed[:100])
             messages = [
                 {
                     "role": "system",
@@ -1476,15 +1420,26 @@ class ReasoningAgent(BaseAgent):
                     "content": possibly_malformed
                 }
             ]
-            response = self.deepseek_chat.chat.completions.create(
-                model="deepseek-chat",
+            response = self.gpt4omini.chat.completions.create(
+                model="gpt-4o",  # Using standard gpt-4o instead of mini
                 messages=messages,
                 max_tokens=self.max_output_tokens,
+                temperature=0.1,  # Lower temperature for more consistent JSON
                 stream=False
             )
-            return response.choices[0].message.content
+            
+            fixed_json = response.choices[0].message.content.strip()
+            if not fixed_json:
+                logger.warning("Empty response from gpt-4o")
+                return "[]"
+                
+            # Validate that it's actually JSON
+            json.loads(fixed_json)  # This will raise JSONDecodeError if invalid
+            logger.debug("Successfully fixed JSON")
+            return fixed_json
+            
         except Exception as e:
-            logger.warning("Unable to fix malformed JSON with deepseek-chat: %s", e)
+            logger.warning("Unable to fix malformed JSON with gpt-4o: %s", e)
             return "[]"
 
     def _merge_chunk_analyses(self, partials: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1539,7 +1494,7 @@ class ReasoningAgent(BaseAgent):
     def _generate_initial_queries(self, question: str) -> List[Dict[str, Any]]:
         """
         We instruct deepseek-reasoner to produce multiple queries in JSON. 
-        If it's malformed, we again correct with deepseek-chat for JSON.
+        If it's malformed, we again correct with gpt-4o-mini for JSON.
         """
         try:
             sanitized_question = " ".join(question.split())
@@ -1568,8 +1523,8 @@ class ReasoningAgent(BaseAgent):
             try:
                 queries = json.loads(raw_text)
             except json.JSONDecodeError:
-                # Fix with deepseek-chat
-                corrected = self._transform_malformed_json_with_chat(raw_text)
+                # Fix with gpt-4o-mini
+                corrected = self._transform_malformed_json_with_gpt4omini(raw_text)
                 try:
                     queries = json.loads(corrected)
                 except:
@@ -1637,7 +1592,7 @@ class ReasoningAgent(BaseAgent):
     
     def _analyze_single_source_gaps(self, question: str, analysis: str, source_id: str) -> List[Dict[str, Any]]:
         """
-        Ask deepseek-reasoner to produce JSON gap info. If malformed, fix with chat.
+        Ask deepseek-reasoner to produce JSON gap info. If malformed, fix with gpt-4o-mini.
         """
         try:
             response = self.deepseek_reasoner.chat.completions.create(
@@ -1665,8 +1620,8 @@ class ReasoningAgent(BaseAgent):
             try:
                 gaps = json.loads(raw_text)
             except json.JSONDecodeError:
-                # fix with chat
-                corrected = self._transform_malformed_json_with_chat(raw_text)
+                # fix with gpt-4o-mini
+                corrected = self._transform_malformed_json_with_gpt4omini(raw_text)
                 try:
                     gaps = json.loads(corrected)
                 except:
@@ -1708,7 +1663,7 @@ class ReasoningAgent(BaseAgent):
     def _should_terminate(self, context: ResearchContext) -> bool:
         """
         Asks deepseek-reasoner for a JSON {complete: bool, confidence: float, missing: []}.
-        If malformed, we fix it with chat. If we get `complete==true and confidence>=0.8`, we return True.
+        If malformed, we fix it with gpt-4o-mini. If we get `complete==true and confidence>=0.8`, we return True.
         """
         analysis_items = context.get_content("main", ContentType.ANALYSIS)
         if not analysis_items:
@@ -1740,8 +1695,8 @@ class ReasoningAgent(BaseAgent):
             try:
                 result = json.loads(raw_text)
             except json.JSONDecodeError:
-                # fix with chat
-                corrected = self._transform_malformed_json_with_chat(raw_text)
+                # fix with gpt-4o-mini
+                corrected = self._transform_malformed_json_with_gpt4omini(raw_text)
                 try:
                     result = json.loads(corrected)
                 except:
@@ -1754,6 +1709,77 @@ class ReasoningAgent(BaseAgent):
             rprint(f"[red]Error checking termination: {e}[/red]")
             logger.exception("Error in _should_terminate check.")
             return False
+
+    def _decide_which_urls_to_explore(self, urls: List[str]) -> List[ResearchDecision]:
+        """
+        Calls DeepSeek to decide which URLs are worth scraping.
+        Returns EXPLORE decisions for URLs deemed worth exploring.
+        """
+        if not urls:
+            return []
+
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert research analyst. I'm giving you a list of URLs.\n"
+                        "Decide which ones are truly worth scraping to gather relevant info.\n"
+                        "Return valid JSON array, each item = { url: str, worth_scraping: bool, rationale: str }.\n"
+                        "No extraneous text outside the JSON array."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Candidate URLs:\n{urls}"
+                }
+            ]
+            response = self.deepseek_reasoner.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=messages,
+                max_tokens=self.max_output_tokens,
+                temperature=0.3,
+                timeout=self.request_timeout
+            )
+            raw_text = response.choices[0].message.content.strip()
+            
+            # Attempt to parse JSON
+            try:
+                plan = json.loads(raw_text)
+            except json.JSONDecodeError:
+                corrected = self._transform_malformed_json_with_gpt4omini(raw_text)
+                plan = json.loads(corrected)
+
+            # Validate
+            if not isinstance(plan, list):
+                return []
+
+            # For each flagged URL, produce an EXPLORE decision
+            explore_decisions = []
+            for item in plan:
+                url = item.get("url")
+                worth = item.get("worth_scraping", False)
+                rationale = item.get("rationale", "")
+                if worth and url:
+                    # Extract domain for grouping
+                    domain = urlparse(url).netloc.lower()
+                    decision = ResearchDecision(
+                        decision_type=DecisionType.EXPLORE,
+                        priority=0.8,
+                        context={
+                            "url": url,
+                            "rationale": rationale,
+                            "domain": domain,
+                            "is_batch": False
+                        },
+                        rationale=f"DeepSeek decided to explore {url}: {rationale}"
+                    )
+                    explore_decisions.append(decision)
+
+            return explore_decisions
+        except Exception as e:
+            logger.exception("Failed deciding which URLs to explore")
+            return []
 ```
 
 ## rat/research/agents/search.py
@@ -1939,247 +1965,170 @@ Key Features:
 4. Content cleaning and formatting
 """
 
+from typing import Dict, List, Any, Optional
 import os
-from typing import Dict, Any, Optional, List
+import logging
+from firecrawl import FirecrawlApp
 from dotenv import load_dotenv
 from rich import print as rprint
-from firecrawl import FirecrawlApp
-import logging
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 class FirecrawlClient:
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        self.api_key = os.getenv("FIRECRAWL_API_KEY")
+    """
+    Client for interacting with the Firecrawl API.
+    Handles webpage scraping and content extraction.
+    """
+    
+    def __init__(self, api_key: Optional[str] = None):
+        """
+        Initialize the Firecrawl client.
+        
+        Args:
+            api_key: Optional API key for Firecrawl. If not provided, will look for FIRECRAWL_API_KEY env var.
+        """
+        self.api_key = api_key or os.getenv("FIRECRAWL_API_KEY")
         if not self.api_key:
-            raise ValueError("FIRECRAWL_API_KEY not found in environment variables")
+            raise ValueError("Firecrawl API key is required. Set FIRECRAWL_API_KEY env var or pass to constructor.")
         
-        # Configuration
-        self.config = config or {}
-        self.request_timeout = self.config.get("request_timeout", 60)  # 60s default
-        
-        # Initialize client (timeout will be used in requests)
         self.app = FirecrawlApp(api_key=self.api_key)
-        
-        logger.info(
-            "FirecrawlClient initialized with timeout=%d",
-            self.request_timeout
-        )
         
     def extract_content(self, url: str) -> Dict[str, Any]:
         """
-        Extract content from a single webpage using Firecrawl's /scrape endpoint.
-        This is the primary method for single-page extraction, returning markdown.
+        Extract content from a single URL.
         
         Args:
             url: The URL to scrape
             
         Returns:
-            Dict containing extracted content and metadata
+            Dict containing the extracted content and metadata
         """
         try:
-            # Ensure URL has protocol
-            if not url.startswith(('http://', 'https://')):
-                url = 'https://' + url
+            result = self.app.scrape_url(url, params={
+                'formats': ['markdown', 'html']
+            })
             
-            logger.info("Extracting content from URL: %s (single scrape)", url)
-            
-            # Make the request to scrape the URL with timeout
-            result = self.app.scrape_url(
-                url,
-                params={
-                    'formats': ['markdown'],
-                    'request_timeout': self.request_timeout
-                }
-            )
-            
-            return self._process_extracted_content(result.get('data', {}), url)
+            # Convert to our expected format
+            return {
+                "text": result.get("markdown", ""),
+                "html": result.get("html", ""),
+                "metadata": result.get("metadata", {})
+            }
             
         except Exception as e:
-            rprint(f"[red]Firecrawl API request failed (single scrape) for {url}: {str(e)}[/red]")
-            logger.exception("Error extracting content from URL (single scrape): %s", url)
+            logger.exception(f"Error extracting content from {url}")
             return {
-                "title": "",
+                "error": str(e),
                 "text": "",
-                "metadata": {
-                    "url": url,
-                    "error": str(e)
-                }
+                "html": "",
+                "metadata": {"url": url}
             }
-
+    
     def scrape_urls_batch(self, urls: List[str]) -> List[Dict[str, Any]]:
         """
-        Batch scrape multiple URLs in one Firecrawl call using /batch/scrape.
-        More efficient than multiple single-page scrapes when you have several URLs.
+        Scrape multiple URLs in batch mode.
         
         Args:
             urls: List of URLs to scrape
             
         Returns:
-            List of processed results, one per URL (preserving order)
+            List of results, one per URL
         """
-        if not urls:
-            return []
-            
-        logger.info("Batch-scraping %d URLs", len(urls))
-        
         try:
-            # Ensure all URLs have protocols
-            urls = [
-                f"https://{url}" if not url.startswith(('http://', 'https://')) else url
-                for url in urls
-            ]
+            # Use the batch scraping endpoint
+            results = self.app.batch_scrape_urls(urls, {
+                'formats': ['markdown', 'html']
+            })
             
-            # Call Firecrawl batch scrape
-            result = self.app.batch_scrape_urls(
-                urls,
-                params={
-                    'formats': ['markdown'],
-                    'request_timeout': self.request_timeout
-                }
-            )
-            
-            # Process each page in the batch
-            batch_data = result.get('data', [])
+            # Convert to list of our expected format
             processed_results = []
+            for result in results.get("data", []):
+                processed_results.append({
+                    "text": result.get("markdown", ""),
+                    "html": result.get("html", ""),
+                    "metadata": result.get("metadata", {})
+                })
             
-            for page_data in batch_data:
-                # Each page_data is similar to a single scrape result
-                processed = self._process_extracted_content(
-                    page_data,
-                    page_data.get('metadata', {}).get('sourceURL', '')
-                )
-                processed_results.append(processed)
-                
             return processed_results
             
         except Exception as e:
-            rprint(f"[red]Firecrawl batch scrape failed: {str(e)}[/red]")
-            logger.exception("Error in batch_scrape_urls for URLs: %s", urls)
-            # Return empty results for all URLs
+            logger.exception(f"Error batch scraping URLs")
+            # Return error results for each URL
             return [
                 {
-                    "title": "",
+                    "error": str(e),
                     "text": "",
-                    "metadata": {
-                        "url": url,
-                        "error": str(e)
-                    }
+                    "html": "",
+                    "metadata": {"url": url}
                 }
                 for url in urls
             ]
 
     def extract_data(self, url: str, prompt: str) -> Dict[str, Any]:
         """
-        Extract structured data from a webpage using Firecrawl's LLM capabilities.
-        Uses the /scrape endpoint with formats=['json'] and a custom prompt.
+        Extract structured data from a webpage using LLM processing.
         
         Args:
             url: The URL to extract data from
-            prompt: Instructions for the LLM about what data to extract
+            prompt: The prompt for structured data extraction
             
         Returns:
-            Dict containing the extracted structured data and metadata
+            Dict containing extracted structured data
         """
+        logger.info("Extracting structured data from %s with prompt", url)
         try:
-            logger.info(
-                "Extracting structured data from URL: %s with prompt='%s'",
-                url, prompt
-            )
-            
-            if not url.startswith(('http://', 'https://')):
-                url = 'https://' + url
-            
-            result = self.app.scrape_url(
-                url,
-                params={
-                    'formats': ['json'],
-                    'jsonOptions': {
-                        'prompt': prompt
-                    },
-                    'request_timeout': self.request_timeout
-                }
-            )
-            
-            data = result.get('data', {})
-            extracted = data.get('json', {})
-            meta = data.get('metadata', {})
-            
-            return {
-                'url': meta.get('sourceURL', url),
-                'extracted_fields': extracted,
-                'metadata': meta
-            }
-            
+            response = self.app.extract(url, prompt, timeout=self.request_timeout)
+            logger.debug("Successfully extracted structured data from %s", url)
+            return response
         except Exception as e:
-            rprint(f"[red]Firecrawl structured extraction failed for {url}: {str(e)}[/red]")
-            logger.exception("Error extracting structured data from URL: %s", url)
-            return {
-                'url': url,
-                'extracted_fields': {},
-                'metadata': {'error': str(e)}
-            }
-            
+            logger.error("Failed to extract structured data from %s: %s", url, str(e))
+            raise
+
     def _process_extracted_content(self, data: Dict[str, Any], original_url: str) -> Dict[str, Any]:
-        """
-        Process and clean the extracted content.
-        
-        Args:
-            data: Raw API response data
-            original_url: The original URL that was scraped
-            
-        Returns:
-            Processed and cleaned content
-        """
-        metadata = data.get("metadata", {})
-        markdown_content = data.get("markdown", "")
-        
-        processed = {
-            "title": metadata.get("title", metadata.get("ogTitle", "")),
-            "text": self._clean_text(markdown_content),
-            "metadata": {
-                "url": metadata.get("sourceURL", original_url),
-                "author": metadata.get("author", ""),
-                "published_date": metadata.get("publishedDate", ""),
-                "domain": metadata.get("ogSiteName", ""),
-                "word_count": len(markdown_content.split()) if markdown_content else 0,
-                "language": metadata.get("language", ""),
-                "status_code": metadata.get("statusCode", 200)
+        """Process and clean the extracted content."""
+        if not data or not isinstance(data, dict):
+            logger.warning("Invalid data received for URL %s", original_url)
+            return {
+                "url": original_url,
+                "content": "",
+                "success": False,
+                "error": "Invalid response data"
             }
+
+        content = data.get("content", "")
+        if not content:
+            logger.warning("No content extracted from %s", original_url)
+            return {
+                "url": original_url,
+                "content": "",
+                "success": False,
+                "error": "No content extracted"
+            }
+
+        cleaned_content = self._clean_text(content)
+        logger.debug("Processed content from %s: %d chars -> %d chars", 
+                    original_url, len(content), len(cleaned_content))
+        
+        return {
+            "url": original_url,
+            "content": cleaned_content,
+            "success": True,
+            "metadata": data.get("metadata", {})
         }
-        
-        return processed
-        
+
     def _clean_text(self, text: str) -> str:
-        """
-        Clean and format extracted text.
-        
-        Args:
-            text: Raw extracted text
-            
-        Returns:
-            Cleaned and formatted text
-        """
+        """Clean and format extracted text content."""
         if not text:
             return ""
             
-        # Remove extra whitespace while preserving markdown formatting
-        lines = text.split("\n")
-        cleaned_lines = []
+        # Basic cleaning operations
+        cleaned = text.strip()
         
-        for line in lines:
-            # Preserve markdown headings and lists
-            if line.strip().startswith(("#", "-", "*", "1.", ">")):
-                cleaned_lines.append(line)
-            else:
-                # Clean normal text lines
-                cleaned = " ".join(line.split())
-                if cleaned:
-                    cleaned_lines.append(cleaned)
-        
-        return "\n\n".join(cleaned_lines)
+        logger.debug("Cleaned text: %d chars -> %d chars", 
+                    len(text), len(cleaned))
+        return cleaned
 ```
 
 ## rat/research/main.py
@@ -2531,9 +2480,8 @@ class ResearchOrchestrator:
                 logger.debug("Terminate decision found in reason_decisions, skipping other agents.")
             else:
                 search_decisions = self.search_agent.analyze(self.current_context)
-                explore_decisions = self.explore_agent.analyze(self.current_context)
-                
-                all_decisions = reason_decisions + search_decisions + explore_decisions
+                # ExploreAgent no longer produces decisions, so we skip calling explore_agent.analyze()
+                all_decisions = reason_decisions + search_decisions
             
             decisions_by_type = {
                 DecisionType.SEARCH: [],
@@ -2932,8 +2880,8 @@ class PerplexityClient:
 
         # Configuration
         self.config = config or {}
-        self.model = self.config.get("model", "sonar")
-        self.request_timeout = self.config.get("request_timeout", 60)  # 60s default
+        self.model = self.config.get("model", "sonar-pro")
+        self.request_timeout = self.config.get("request_timeout", 120)  # 60s default
         self.system_message = "You are a research assistant helping to find accurate, up-to-date information."
         
         logger.info(
@@ -2972,7 +2920,6 @@ class PerplexityClient:
             # "search_domain_filter": ["perplexity.ai"],
             "return_images": False,
             "return_related_questions": False,
-            "search_recency_filter": "month",
             "top_k": 0,
             "stream": False,
             # presence_penalty and frequency_penalty can be adjusted as needed

@@ -65,7 +65,6 @@ class PerplexityClient:
             # "search_domain_filter": ["perplexity.ai"],
             "return_images": False,
             "return_related_questions": False,
-            "search_recency_filter": "month",
             "top_k": 0,
             "stream": False,
             # presence_penalty and frequency_penalty can be adjusted as needed

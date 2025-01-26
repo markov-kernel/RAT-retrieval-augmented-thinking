@@ -5,7 +5,7 @@ Supports parallel processing of content analysis and decision making.
 
 Enhancement:
 1. We still instruct deepseek-reasoner to produce JSON, but it may be malformed.
-2. We do a "second pass" with deepseek-chat if parsing fails, passing `response_format={'type':'json_object'}` to obtain valid JSON.
+2. We do a "second pass" with gpt-4o-mini if parsing fails, passing the raw text to fix into valid JSON.
 3. This preserves all existing flows while guaranteeing structured JSON where needed.
 """
 
@@ -18,6 +18,7 @@ from rich import print as rprint
 from openai import OpenAI
 import os
 import logging
+from urllib.parse import urlparse
 
 from .base import BaseAgent, ResearchDecision, DecisionType
 from .context import ResearchContext, ContentType, ContentItem
@@ -39,8 +40,7 @@ class ReasoningAgent(BaseAgent):
     Also drives the research forward (search, explore, or terminate).
 
     - We instruct the deepseek-reasoner to produce JSON, then attempt to parse it.
-    - If parsing fails, we call deepseek-chat with response_format={'type':'json_object'}
-      to repair/morph the text into valid JSON.
+    - If parsing fails, we call gpt-4o-mini to repair/morph the text into valid JSON.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -52,11 +52,10 @@ class ReasoningAgent(BaseAgent):
             base_url="https://api.deepseek.com"
         )
 
-        # Secondary client for deepseek-chat calls (to fix malformed JSON)
-        # You can reuse the same DEEPSEEK_API_KEY or have a separate one.
-        self.deepseek_chat = OpenAI(
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com"
+        # Secondary client for gpt-4o-mini calls (to fix malformed JSON)
+        self.gpt4omini = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),  # Using standard OpenAI API key
+            base_url="https://api.openai.com/v1"     # Standard OpenAI endpoint
         )
         
         self.max_parallel_tasks = self.config.get("max_parallel_tasks", 3)
@@ -96,17 +95,42 @@ class ReasoningAgent(BaseAgent):
                 )
             return decisions
         
-        # Identify unprocessed search or explored content
+        # Identify unprocessed search results for URL evaluation
         unprocessed_search = [
             item for item in search_results
-            if not item.metadata.get("analyzed_by_reasoner")
+            if not item.metadata.get("analyzed_for_explore")
         ]
+        
+        # Mark them as processed
+        for item in unprocessed_search:
+            item.metadata["analyzed_for_explore"] = True
+
+        # Gather candidate URLs from unprocessed search results
+        candidate_urls = []
+        for item in unprocessed_search:
+            if isinstance(item.content, dict):
+                urls = item.content.get("urls", [])
+                for url in urls:
+                    candidate_urls.append(url)
+            elif isinstance(item.content, str):
+                # Handle case where content is a string with URLs in metadata
+                urls = item.metadata.get("urls", [])
+                for url in urls:
+                    candidate_urls.append(url)
+
+        # Ask DeepSeek which URLs are worth exploring
+        if candidate_urls:
+            explore_decisions = self._decide_which_urls_to_explore(candidate_urls)
+            decisions.extend(explore_decisions)
+
+        # Continue with existing logic for analyzing content
         explored_content = context.get_content("main", ContentType.EXPLORED_CONTENT)
         unprocessed_explored = [
             item for item in explored_content
             if not item.metadata.get("analyzed_by_reasoner")
         ]
-        
+
+        # Process unprocessed content
         for item in unprocessed_search + unprocessed_explored:
             if item.priority < self.min_priority:
                 continue
@@ -213,7 +237,7 @@ class ReasoningAgent(BaseAgent):
                 raise ValueError(msg)
             
             # Instruct deepseek-reasoner to produce JSON in the analysis
-            # (Might be malformed; we will fix it with deepseek-chat if needed.)
+            # (Might be malformed; we will fix it with gpt-4o-mini if needed.)
             single_result = self._analyze_content_chunk(content, content_type)
             success = bool(single_result.get("analysis"))
 
@@ -262,11 +286,12 @@ class ReasoningAgent(BaseAgent):
     
     def _analyze_content_chunk(self, content: str, content_type: str) -> Dict[str, Any]:
         """
-        Analyze a chunk of content using DeepSeek.
-        Handles both single-page and batch exploration results.
+        1) Ask DeepSeek for plain text labeled with "Analysis:" and "Insights:".
+        2) Pass that text to GPT‑4O mini, instructing it to produce valid JSON with
+           keys: "analysis" (string) and "insights" (list of strings).
         """
         try:
-            # Prepare the content for analysis
+            # Handle explored content specially
             if content_type == ContentType.EXPLORED_CONTENT.value:
                 # Parse the content if it's a string
                 if isinstance(content, str):
@@ -287,62 +312,46 @@ class ReasoningAgent(BaseAgent):
                         # Skip empty or error results
                         if not result or "error" in result:
                             continue
-                            
-                        # Analyze the individual page
-                        page_analysis = self._analyze_single_page(result, url)
-                        if page_analysis:
-                            combined_analysis.append(
-                                f"Page {idx + 1} ({url}):\n{page_analysis['analysis']}"
-                            )
-                            combined_insights.extend(page_analysis.get("insights", []))
-                    
-                    # Combine all analyses
-                    return {
-                        "analysis": "\n\n".join(combined_analysis),
-                        "insights": combined_insights,
-                        "content_type": content_type,
-                        "domain": domain,
-                        "url_count": len(urls),
-                        "successful_analyses": len(combined_analysis)
-                    }
+                        
+                        # Single page result
+                        return self._analyze_single_page(content, content.get("metadata", {}).get("url", ""))
                 else:
-                    # Single page result
-                    return self._analyze_single_page(content, content.get("metadata", {}).get("url", ""))
-            else:
-                # Handle search results or other content types
-                messages = [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an expert research analyst. Analyze the following content "
-                            "and provide insights. Format your response as JSON with 'analysis' "
-                            "and 'insights' fields. Keep insights concise and focused."
+                    # Handle search results or other content types
+                    messages = [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are an expert research analyst. Please provide a short textual analysis:\n\n"
+                                "Start with 'Analysis:' followed by your overall analysis. Then 'Insights:' as a bullet list.\n"
+                                "No need to produce JSON—just labeled text.\n"
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Content type: {content_type}\n\nContent to analyze:\n{content}"
+                        }
+                    ]
+                    
+                    response = self.deepseek_reasoner.chat.completions.create(
+                        model="deepseek-reasoner",
+                        messages=messages,
+                        max_tokens=self.max_output_tokens,
+                        temperature=0.3,
+                        timeout=self.request_timeout
+                    )
+                    
+                    deepseek_text = response.choices[0].message.content
+                    
+                    # Now pass the labeled text to GPT-4O mini to produce final JSON
+                    fixed_json = self._transform_malformed_json_with_gpt4omini(
+                        deepseek_text,
+                        system_instruction=(
+                            "You are an assistant that strictly outputs valid JSON with exactly two keys: "
+                            "'analysis' (string) and 'insights' (an array of short strings). The user has provided "
+                            "text containing lines labeled 'Analysis:' and 'Insights:'. Convert that to valid JSON. "
+                            "If you cannot parse it, output '{}'."
                         )
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Content type: {content_type}\n\nContent to analyze:\n{content}"
-                    }
-                ]
-                
-                response = self.deepseek_reasoner.chat.completions.create(
-                    model="deepseek-reasoner",
-                    messages=messages,
-                    max_tokens=self.max_output_tokens,
-                    temperature=0.3,
-                    timeout=self.request_timeout
-                )
-                
-                try:
-                    result_text = response.choices[0].message.content
-                    result_json = json.loads(result_text)
-                    return {
-                        **result_json,
-                        "content_type": content_type
-                    }
-                except json.JSONDecodeError:
-                    # If JSON is malformed, try to fix it with deepseek-chat
-                    fixed_json = self._transform_malformed_json_with_chat(result_text)
+                    )
                     result_json = json.loads(fixed_json)
                     return {
                         **result_json,
@@ -360,7 +369,8 @@ class ReasoningAgent(BaseAgent):
             
     def _analyze_single_page(self, content: Dict[str, Any], url: str) -> Dict[str, Any]:
         """
-        Analyze a single webpage's content.
+        Analyze a single webpage's content using labeled text from DeepSeek,
+        then convert to JSON via GPT-4O mini.
         
         Args:
             content: The page content and metadata
@@ -382,9 +392,9 @@ class ReasoningAgent(BaseAgent):
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert research analyst. Analyze the following webpage "
-                        "content and provide insights. Format your response as JSON with "
-                        "'analysis' and 'insights' fields. Keep insights concise and focused."
+                        "You are an expert research analyst. Please provide a short textual analysis:\n\n"
+                        "Start with 'Analysis:' followed by your overall analysis. Then 'Insights:' as a bullet list.\n"
+                        "No need to produce JSON—just labeled text.\n"
                     )
                 },
                 {
@@ -401,23 +411,24 @@ class ReasoningAgent(BaseAgent):
                 timeout=self.request_timeout
             )
             
-            try:
-                result_text = response.choices[0].message.content
-                result_json = json.loads(result_text)
-                return {
-                    **result_json,
-                    "url": url,
-                    "metadata": metadata
-                }
-            except json.JSONDecodeError:
-                # If JSON is malformed, try to fix it with deepseek-chat
-                fixed_json = self._transform_malformed_json_with_chat(result_text)
-                result_json = json.loads(fixed_json)
-                return {
-                    **result_json,
-                    "url": url,
-                    "metadata": metadata
-                }
+            deepseek_text = response.choices[0].message.content
+            
+            # Convert the labeled text to final JSON:
+            fixed_json = self._transform_malformed_json_with_gpt4omini(
+                deepseek_text,
+                system_instruction=(
+                    "You are an assistant that strictly outputs valid JSON with exactly two keys: "
+                    "'analysis' (string) and 'insights' (an array of short strings). The user text is labeled "
+                    "'Analysis:' and 'Insights:'. Convert it to valid JSON. If you cannot parse, output '{}'."
+                )
+            )
+            result_json = json.loads(fixed_json)
+            
+            return {
+                **result_json,
+                "url": url,
+                "metadata": metadata
+            }
                 
         except Exception as e:
             logger.exception("Error analyzing single page: %s", url)
@@ -428,38 +439,47 @@ class ReasoningAgent(BaseAgent):
                 "url": url
             }
 
-    def _transform_malformed_json_with_chat(self, possibly_malformed: str) -> str:
+    def _transform_malformed_json_with_gpt4omini(self, possibly_malformed: str, system_instruction: str) -> str:
         """
-        Call deepseek-chat to fix malformed JSON text.
+        Call gpt-4o-mini to fix malformed JSON text.
         Returns the corrected JSON string or "[]" if it cannot repair it.
         """
+        if not possibly_malformed or not possibly_malformed.strip():
+            logger.warning("Empty input to _transform_malformed_json_with_gpt4omini")
+            return "[]"
+            
         try:
+            logger.debug("Attempting to fix malformed JSON: %s", possibly_malformed[:100])
             messages = [
                 {
                     "role": "system",
-                    "content": (
-                        "You are an assistant that strictly outputs valid JSON. "
-                        "Take the user's input (which may be malformed JSON or random text) "
-                        "and produce well-formed JSON that best represents it. "
-                        "If the input appears to be an array, output a JSON array. "
-                        "Otherwise output a JSON object. "
-                        "If you cannot parse it meaningfully, output an empty array."
-                    )
+                    "content": system_instruction
                 },
                 {
                     "role": "user",
                     "content": possibly_malformed
                 }
             ]
-            response = self.deepseek_chat.chat.completions.create(
-                model="deepseek-chat",
+            response = self.gpt4omini.chat.completions.create(
+                model="gpt-4o",  # Using standard gpt-4o instead of mini
                 messages=messages,
                 max_tokens=self.max_output_tokens,
+                temperature=0.1,  # Lower temperature for more consistent JSON
                 stream=False
             )
-            return response.choices[0].message.content
+            
+            fixed_json = response.choices[0].message.content.strip()
+            if not fixed_json:
+                logger.warning("Empty response from gpt-4o")
+                return "[]"
+                
+            # Validate that it's actually JSON
+            json.loads(fixed_json)  # This will raise JSONDecodeError if invalid
+            logger.debug("Successfully fixed JSON")
+            return fixed_json
+            
         except Exception as e:
-            logger.warning("Unable to fix malformed JSON with deepseek-chat: %s", e)
+            logger.warning("Unable to fix malformed JSON with gpt-4o: %s", e)
             return "[]"
 
     def _merge_chunk_analyses(self, partials: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -513,8 +533,7 @@ class ReasoningAgent(BaseAgent):
 
     def _generate_initial_queries(self, question: str) -> List[Dict[str, Any]]:
         """
-        We instruct deepseek-reasoner to produce multiple queries in JSON. 
-        If it's malformed, we again correct with deepseek-chat for JSON.
+        Ask DeepSeek for labeled text with search queries, then convert to JSON via GPT-4O mini.
         """
         try:
             sanitized_question = " ".join(question.split())
@@ -524,9 +543,13 @@ class ReasoningAgent(BaseAgent):
                     {
                         "role": "system",
                         "content": (
-                            "Generate exactly 3 to 5 different search queries in valid JSON format. "
-                            "Each item in the JSON array must be an object with 'query' and 'rationale' keys. "
-                            "No text outside the JSON array."
+                            "Generate 3-5 search queries to help answer the user's question.\n\n"
+                            "Format your response with:\n"
+                            "Queries:\n"
+                            "1. [query text] - [rationale]\n"
+                            "2. [query text] - [rationale]\n"
+                            "etc.\n"
+                            "No need for JSON—just the labeled text format above."
                         )
                     },
                     {
@@ -539,20 +562,20 @@ class ReasoningAgent(BaseAgent):
                 stream=False
             )
             raw_text = reasoner_response.choices[0].message.content.strip()
-            # Try to parse
-            try:
-                queries = json.loads(raw_text)
-            except json.JSONDecodeError:
-                # Fix with deepseek-chat
-                corrected = self._transform_malformed_json_with_chat(raw_text)
-                try:
-                    queries = json.loads(corrected)
-                except:
-                    # fallback
-                    return [{
-                        "query": question,
-                        "rationale": "Direct fallback search - JSON fix failed"
-                    }]
+            
+            # Convert to JSON via GPT-4O mini
+            fixed_json = self._transform_malformed_json_with_gpt4omini(
+                raw_text,
+                system_instruction=(
+                    "You are an assistant that strictly outputs a JSON array. Each item must have "
+                    "'query' (string) and 'rationale' (string) fields. The input is a list of queries "
+                    "with rationales in the format 'N. [query] - [rationale]'. Convert to JSON array. "
+                    "If you cannot parse meaningfully, output '[{\"query\": \"fallback\", \"rationale\": \"direct search\"}]'."
+                )
+            )
+            
+            queries = json.loads(fixed_json)
+            
             # Validate minimal structure
             if not isinstance(queries, list):
                 raise ValueError("Expected a JSON list of queries.")
@@ -612,7 +635,7 @@ class ReasoningAgent(BaseAgent):
     
     def _analyze_single_source_gaps(self, question: str, analysis: str, source_id: str) -> List[Dict[str, Any]]:
         """
-        Ask deepseek-reasoner to produce JSON gap info. If malformed, fix with chat.
+        Ask DeepSeek to identify knowledge gaps in labeled text format, then convert to JSON via GPT-4O mini.
         """
         try:
             response = self.deepseek_reasoner.chat.completions.create(
@@ -621,9 +644,11 @@ class ReasoningAgent(BaseAgent):
                     {
                         "role": "system",
                         "content": (
-                            "Identify knowledge gaps in the current analysis. Output valid JSON array. "
-                            "Each item must have: 'type' (search|explore), 'query' or 'url', 'rationale'. "
-                            "No text outside the JSON array."
+                            "Identify knowledge gaps in the current analysis. For each gap, specify:\n\n"
+                            "Type: [search|explore]\n"
+                            "Action: [search query or URL to explore]\n"
+                            "Rationale: [why this would help]\n\n"
+                            "No need for JSON—just list the gaps in this format."
                         )
                     },
                     {
@@ -637,16 +662,18 @@ class ReasoningAgent(BaseAgent):
             )
             raw_text = response.choices[0].message.content.strip()
             
-            try:
-                gaps = json.loads(raw_text)
-            except json.JSONDecodeError:
-                # fix with chat
-                corrected = self._transform_malformed_json_with_chat(raw_text)
-                try:
-                    gaps = json.loads(corrected)
-                except:
-                    # fallback
-                    return []
+            # Convert to JSON via GPT-4O mini
+            fixed_json = self._transform_malformed_json_with_gpt4omini(
+                raw_text,
+                system_instruction=(
+                    "You are an assistant that strictly outputs a JSON array. Each item must have: "
+                    "'type' (either 'search' or 'explore'), 'query' (if type is search) or 'url' (if type is explore), "
+                    "and 'rationale' (string). The input text describes gaps with Type/Action/Rationale. "
+                    "Convert to a JSON array. If you cannot parse meaningfully, output '[]'."
+                )
+            )
+            
+            gaps = json.loads(fixed_json)
             
             if not isinstance(gaps, list):
                 raise ValueError("Expected JSON list.")
@@ -682,8 +709,8 @@ class ReasoningAgent(BaseAgent):
 
     def _should_terminate(self, context: ResearchContext) -> bool:
         """
-        Asks deepseek-reasoner for a JSON {complete: bool, confidence: float, missing: []}.
-        If malformed, we fix it with chat. If we get `complete==true and confidence>=0.8`, we return True.
+        Ask DeepSeek for completion assessment in labeled text format, then convert to JSON via GPT-4O mini.
+        Returns True if research is complete with high confidence.
         """
         analysis_items = context.get_content("main", ContentType.ANALYSIS)
         if not analysis_items:
@@ -697,8 +724,13 @@ class ReasoningAgent(BaseAgent):
                     {
                         "role": "system",
                         "content": (
-                            "You are a research completion analyst. Evaluate if we have enough info. "
-                            "Return JSON with {\"complete\": bool, \"confidence\": 0..1, \"missing\": []}."
+                            "Evaluate if we have enough information to answer the question.\n\n"
+                            "Format your response as:\n"
+                            "Complete: [yes/no]\n"
+                            "Confidence: [0.0-1.0]\n"
+                            "Missing Information:\n"
+                            "- [list any missing key points]\n\n"
+                            "No need for JSON—just use this labeled format."
                         )
                     },
                     {
@@ -711,16 +743,23 @@ class ReasoningAgent(BaseAgent):
                 stream=False
             )
             raw_text = response.choices[0].message.content
-            # try parse
+            
+            # Convert to JSON via GPT-4O mini
+            fixed_json = self._transform_malformed_json_with_gpt4omini(
+                raw_text,
+                system_instruction=(
+                    "You are an assistant that strictly outputs a JSON object with exactly three keys: "
+                    "'complete' (boolean), 'confidence' (number 0-1), and 'missing' (array of strings). "
+                    "The input text has labeled sections for Complete/Confidence/Missing Information. "
+                    "Convert to JSON. If you cannot parse meaningfully, output "
+                    "'{\"complete\": false, \"confidence\": 0, \"missing\": []}'."
+                )
+            )
+            
             try:
-                result = json.loads(raw_text)
-            except json.JSONDecodeError:
-                # fix with chat
-                corrected = self._transform_malformed_json_with_chat(raw_text)
-                try:
-                    result = json.loads(corrected)
-                except:
-                    return False
+                result = json.loads(fixed_json)
+            except:
+                return False
 
             complete = bool(result.get("complete", False))
             confidence = float(result.get("confidence", 0))
@@ -729,3 +768,82 @@ class ReasoningAgent(BaseAgent):
             rprint(f"[red]Error checking termination: {e}[/red]")
             logger.exception("Error in _should_terminate check.")
             return False
+
+    def _decide_which_urls_to_explore(self, urls: List[str]) -> List[ResearchDecision]:
+        """
+        Ask DeepSeek to evaluate URLs in labeled text format, then convert to JSON via GPT-4O mini.
+        Returns EXPLORE decisions for URLs deemed worth exploring.
+        """
+        if not urls:
+            return []
+
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert research analyst. For each URL, evaluate if it's worth scraping.\n\n"
+                        "Format your response as:\n"
+                        "URL: [url]\n"
+                        "Worth Scraping: [yes/no]\n"
+                        "Rationale: [explanation]\n\n"
+                        "Repeat this format for each URL. No need for JSON."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": f"Candidate URLs:\n{urls}"
+                }
+            ]
+            response = self.deepseek_reasoner.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=messages,
+                max_tokens=self.max_output_tokens,
+                temperature=0.3,
+                timeout=self.request_timeout
+            )
+            raw_text = response.choices[0].message.content.strip()
+            
+            # Convert to JSON via GPT-4O mini
+            fixed_json = self._transform_malformed_json_with_gpt4omini(
+                raw_text,
+                system_instruction=(
+                    "You are an assistant that strictly outputs a JSON array. Each item must have: "
+                    "'url' (string), 'worth_scraping' (boolean), and 'rationale' (string). "
+                    "The input text has labeled sections for each URL with Worth Scraping and Rationale. "
+                    "Convert to JSON array. If you cannot parse meaningfully, output '[]'."
+                )
+            )
+            
+            plan = json.loads(fixed_json)
+
+            # Validate
+            if not isinstance(plan, list):
+                return []
+
+            # For each flagged URL, produce an EXPLORE decision
+            explore_decisions = []
+            for item in plan:
+                url = item.get("url")
+                worth = item.get("worth_scraping", False)
+                rationale = item.get("rationale", "")
+                if worth and url:
+                    # Extract domain for grouping
+                    domain = urlparse(url).netloc.lower()
+                    decision = ResearchDecision(
+                        decision_type=DecisionType.EXPLORE,
+                        priority=0.8,
+                        context={
+                            "url": url,
+                            "rationale": rationale,
+                            "domain": domain,
+                            "is_batch": False
+                        },
+                        rationale=f"DeepSeek decided to explore {url}: {rationale}"
+                    )
+                    explore_decisions.append(decision)
+            
+            return explore_decisions
+        except Exception as e:
+            logger.exception("Failed deciding which URLs to explore")
+            return []

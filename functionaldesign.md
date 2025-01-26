@@ -1,91 +1,60 @@
-# RAT - Retrieval Augmented Thinking
-## Functional Design Document
+# RAT (Retrieval Augmented Thinking) - Functional Design
 
-### Overview
-RAT (Retrieval Augmented Thinking) is a multi-agent research system that leverages various AI models to conduct comprehensive research and analysis. The system uses specialized agents for different aspects of the research process.
+## System Overview
+RAT is a multi-agent research system that enhances AI responses through structured reasoning and research. The system uses multiple specialized agents working together to gather, analyze, and synthesize information.
 
-### Core Components
+## Core Components
 
-#### 1. Main Components
-- Research Orchestrator: Coordinates all agents and manages the research flow
-- Output Manager: Handles research output formatting and storage
-- Logging System: Centralized logging with file-based storage
+### 1. Agent Architecture
+- **SearchAgent**: Uses Perplexity API for intelligent web searches
+- **ExploreAgent**: Uses Firecrawl API for content extraction from URLs
+- **ReasoningAgent**: Uses DeepSeek for analysis and GPT-4o-mini for JSON repair
+- **ResearchOrchestrator**: Coordinates agent interactions and research flow
 
-#### 2. Specialized Agents
-- Search Agent (Perplexity): Conducts intelligent web searches
-- Explore Agent (Firecrawl): Extracts content from URLs
-- Reasoning Agent (DeepSeek): Analyzes content and makes decisions
-- Execution Agent (Claude): Generates code and structured output
+### 2. Key Interfaces
+- **PerplexityClient**: Interface for web search functionality
+- **FirecrawlClient**: Interface for web scraping and content extraction
+- **OutputManager**: Handles research output and metrics storage
 
-### Key Requirements
+### 3. Data Flow
+1. User submits research question
+2. SearchAgent generates and executes search queries
+3. ExploreAgent extracts content from discovered URLs
+4. ReasoningAgent analyzes gathered information
+5. System generates final research paper
 
-1. Architecture and Design
-- Follow SOLID principles and modular architecture
-- Implement clear separation of concerns
-- Use appropriate design patterns
-- Maintain clean code structure
+## Technical Decisions
 
-2. Error Handling and Logging
-- Centralized logging in rat.log (overwritten each run)
-- Consistent error handling across all components
-- Proper exception handling with meaningful messages
-- Log levels: INFO for normal operations, ERROR for issues
+### API Integration
+- Perplexity API for intelligent search
+- Firecrawl API for web scraping
+- DeepSeek API for reasoning
+- GPT-4o-mini for JSON repair
 
-3. API Integration
-- Remove invalid "role": "system" usage from API calls
-- Use single prompt format for all AI model interactions
-- Handle API rate limits and retries
-- Proper error handling for API failures
+### Environment Configuration
+Required environment variables:
+- PERPLEXITY_API_KEY
+- FIRECRAWL_API_KEY
+- DEEPSEEK_API_KEY
+- GPT4OMINI_API_KEY
 
-4. Performance and Scalability
-- Support parallel processing where appropriate
-- Implement rate limiting for API calls
-- Handle large content chunks efficiently
-- Manage memory usage for large datasets
+### Parallel Processing
+- Supports parallel execution of agent decisions
+- Rate limiting and concurrency controls
+- Thread-safe operations for shared resources
 
-### Technical Specifications
+## Future Improvements
+1. Enhanced error handling and recovery
+2. Improved content deduplication
+3. More sophisticated research strategies
+4. Better handling of rate limits
+5. Enhanced metrics and monitoring
 
-1. Logging Configuration
-- Location: rat.log in root directory
-- Format: "%(asctime)s %(levelname)s %(name)s %(message)s"
-- Mode: Overwrite on each run
-- Level: INFO as default
-
-2. API Interactions
-- Perplexity: Single prompt format for searches
-- DeepSeek: Single prompt for content analysis
-- Claude: Single prompt for code generation
-- Proper API key management via environment variables
-
-3. Code Structure
-- Modular design with clear responsibilities
-- Consistent error handling patterns
-- Clean separation of concerns
-- Well-documented interfaces
-
-### Future Improvements (TODOs)
-1. Add more sophisticated error recovery mechanisms
-2. Implement caching for API responses
-3. Add metrics collection and monitoring
-4. Enhance parallel processing capabilities
-5. Add support for more AI models/providers
-
-### Non-Functional Requirements
-1. Performance
-- Response time < 5s for basic operations
-- Graceful handling of API timeouts
-- Efficient memory usage
-
-2. Security
-- Secure API key management
-- No sensitive data in logs
-- Input validation and sanitization
-
-3. Maintainability
-- Clear documentation
-- Consistent coding style
-- Comprehensive logging
-- Easy configuration management
+## Security Considerations
+- API keys stored in environment variables
+- No hardcoded credentials
+- Safe URL handling and validation
+- Input sanitization
 
 ## System Architecture
 
