@@ -11,11 +11,11 @@ from rich import print as rprint
 
 class DecisionType(Enum):
     """Types of decisions an agent can make during research."""
-    SEARCH = "search"  # New search query needed
-    EXPLORE = "explore"  # URL exploration needed
-    REASON = "reason"  # Deep analysis needed
-    EXECUTE = "execute"  # Code execution needed
-    TERMINATE = "terminate"  # Research complete
+    SEARCH = "search"      # New search query needed
+    EXPLORE = "explore"    # URL exploration needed
+    REASON = "reason"      # Deep analysis needed (deepseek-reasoner)
+    EXECUTE = "execute"    # Code or structured output needed
+    TERMINATE = "terminate"# Research complete or no further steps
 
 @dataclass
 class ResearchDecision:

@@ -57,43 +57,34 @@ class ExploreAgent(BaseAgent):
         
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
         """
-        Analyze the research context and decide on URL exploration actions.
-        
-        Args:
-            context: Current research context
-            
-        Returns:
-            List of exploration-related decisions
+        Look at search results, generate decisions to explore unvisited URLs.
         """
         decisions = []
         
-        # Get search results to find URLs
-        search_results = context.get_content(
-            "main",
-            ContentType.SEARCH_RESULT
-        )
+        # Get search results with potential URLs
+        search_results = context.get_content("main", ContentType.SEARCH_RESULT)
         
         # Check if we've hit our URL limit
         if len(self.explored_urls) >= self.max_urls:
-            rprint("[yellow]Explore agent: Maximum number of URLs reached[/yellow]")
+            rprint("[yellow]ExploreAgent: Reached maximum URL limit[/yellow]")
             return decisions
         
         # Process each search result
         for result in search_results:
+            if not isinstance(result.content, dict):
+                # Some search results might be plain text; skip
+                continue
             urls = result.content.get("urls", [])
             query_id = result.content.get("query_id")
             
             for url in urls:
+                # Basic domain checks
                 if not self._is_valid_url(url):
                     continue
-                    
-                # Skip if already explored
                 if url in self.explored_urls:
                     continue
-                    
-                # Calculate priority based on result priority
-                priority = result.priority * 0.8  # Slight reduction from search priority
                 
+                priority = result.priority * 0.8  # Weighted from search result
                 if priority >= self.min_priority:
                     decisions.append(
                         ResearchDecision(
@@ -104,7 +95,7 @@ class ExploreAgent(BaseAgent):
                                 "source_query_id": query_id,
                                 "rationale": f"URL found in search results: {url}"
                             },
-                            rationale=f"New URL discovered from search"
+                            rationale="New URL discovered via search"
                         )
                     )
                     
@@ -139,30 +130,29 @@ class ExploreAgent(BaseAgent):
         try:
             url = decision.context["url"]
             
-            # Extract content
+            # Extract content via Firecrawl
             results = self.firecrawl.extract_content(url)
             
-            # Track the exploration
+            # Track exploration
             self.explored_urls[url] = ExplorationTarget(
                 url=url,
                 priority=decision.priority,
                 rationale=decision.context["rationale"],
-                source_query_id=decision.context.get("source_query_id"),
-                timestamp=time.time()
+                source_query_id=decision.context.get("source_query_id")
             )
             
             success = bool(results.get("text"))
             if success:
-                rprint(f"[green]Content extracted: {url}[/green]")
+                rprint(f"[green]ExploreAgent: Content extracted from {url}[/green]")
             else:
-                rprint(f"[yellow]No content extracted from: {url}[/yellow]")
+                rprint(f"[yellow]ExploreAgent: No content extracted from {url}[/yellow]")
                 
         except Exception as e:
-            rprint(f"[red]Exploration error: {str(e)}[/red]")
+            rprint(f"[red]ExploreAgent error: {str(e)}[/red]")
             results = {
                 "error": str(e),
                 "text": "",
-                "metadata": {"url": url}
+                "metadata": {"url": decision.context.get("url", "")}
             }
             
         finally:

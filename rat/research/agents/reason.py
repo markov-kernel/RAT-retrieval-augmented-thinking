@@ -1,6 +1,6 @@
 """
-Reasoning agent for analyzing research content using DeepSeek.
-Handles content analysis, parallel processing, and insight generation.
+Reasoning agent for analyzing research content using DeepSeek (deepseek-reasoner).
+Now it also acts as the "lead agent" that decides next steps (search, explore, etc.).
 """
 
 from typing import List, Dict, Any, Optional
@@ -20,10 +20,10 @@ class AnalysisTask:
     Represents a content analysis task.
     
     Attributes:
-        content: Content to analyze
+        content: The textual content to analyze
         priority: Analysis priority (0-1)
         rationale: Why this analysis is needed
-        chunk_index: Index if this is part of a chunked analysis
+        chunk_index: If chunked, the index of this chunk
     """
     content: str
     priority: float
@@ -33,10 +33,11 @@ class AnalysisTask:
 
 class ReasoningAgent(BaseAgent):
     """
-    Agent responsible for analyzing content using the DeepSeek API.
+    Agent responsible for analyzing content using the DeepSeek API (deepseek-reasoner).
     
-    Handles content analysis, parallel processing for large contexts,
-    and insight generation.
+    - Splits content into chunks if exceeding 64k tokens
+    - Runs parallel analysis with multiple deepseek calls
+    - Merges results and can produce further decisions (SEARCH, EXPLORE) if needed
     """
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -56,7 +57,8 @@ class ReasoningAgent(BaseAgent):
         
         # Configuration
         self.max_parallel_tasks = self.config.get("max_parallel_tasks", 3)
-        self.chunk_size = self.config.get("chunk_size", 30000)  # ~30k tokens per chunk
+        # We enforce the official 64k limit for deepseek reasoning calls
+        self.max_tokens_per_call = 64000
         self.min_priority = self.config.get("min_priority", 0.3)
         
         # Tracking
@@ -64,46 +66,109 @@ class ReasoningAgent(BaseAgent):
         
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
         """
-        Analyze the research context and decide on reasoning tasks.
-        
-        Args:
-            context: Current research context
-            
-        Returns:
-            List of reasoning-related decisions
+        Primary entry point for making decisions about next research steps.
+        The ReasoningAgent is now the primary driver of research, deciding:
+        1. What searches to run
+        2. Which URLs to explore
+        3. When to analyze content
+        4. When to terminate research
         """
         decisions = []
         
-        # Get content needing analysis
-        search_results = context.get_content(
-            "main",
-            ContentType.SEARCH_RESULT
-        )
-        explored_content = context.get_content(
-            "main",
-            ContentType.URL_CONTENT
+        # 1. If no search results yet, start with a broad search
+        search_results = context.get_content("main", ContentType.SEARCH_RESULT)
+        if not search_results:
+            decisions.append(
+                ResearchDecision(
+                    decision_type=DecisionType.SEARCH,
+                    priority=1.0,
+                    context={
+                        "query": context.initial_question,
+                        "rationale": "Initial broad search for the research question"
+                    },
+                    rationale="Starting research with a broad search query"
+                )
+            )
+            return decisions
+        
+        # 2. Process any unanalyzed content (from search or exploration)
+        unprocessed_search = [
+            item for item in search_results
+            if not item.metadata.get("analyzed_by_reasoner")
+        ]
+        
+        explored_content = context.get_content("main", ContentType.EXPLORED_CONTENT)
+        unprocessed_explored = [
+            item for item in explored_content
+            if not item.metadata.get("analyzed_by_reasoner")
+        ]
+        
+        # Create REASON decisions for unprocessed content
+        for item in unprocessed_search + unprocessed_explored:
+            if item.priority < self.min_priority:
+                continue
+                
+            decisions.append(
+                ResearchDecision(
+                    decision_type=DecisionType.REASON,
+                    priority=0.9,
+                    context={
+                        "content": item.content,
+                        "content_type": item.content_type.value,
+                        "item_id": item.id
+                    },
+                    rationale=f"Analyze new {item.content_type.value} content"
+                )
+            )
+        
+        # 3. Check existing analysis to identify knowledge gaps
+        analysis_items = context.get_content("main", ContentType.ANALYSIS)
+        combined_analysis = " ".join(str(a.content) for a in analysis_items)
+        
+        # Example knowledge gap checks (customize based on your needs):
+        gaps = self._identify_knowledge_gaps(
+            context.initial_question,
+            combined_analysis
         )
         
-        # Analyze search results
-        if search_results:
-            decisions.extend(
-                self._create_analysis_decisions(
-                    content_items=search_results,
-                    content_type="search_results",
-                    base_priority=0.9
+        # Create new SEARCH or EXPLORE decisions for gaps
+        for gap in gaps:
+            if gap["type"] == "search":
+                decisions.append(
+                    ResearchDecision(
+                        decision_type=DecisionType.SEARCH,
+                        priority=0.8,
+                        context={
+                            "query": gap["query"],
+                            "rationale": gap["rationale"]
+                        },
+                        rationale=f"Fill knowledge gap: {gap['rationale']}"
+                    )
+                )
+            elif gap["type"] == "explore":
+                decisions.append(
+                    ResearchDecision(
+                        decision_type=DecisionType.EXPLORE,
+                        priority=0.75,
+                        context={
+                            "url": gap["url"],
+                            "rationale": gap["rationale"]
+                        },
+                        rationale=f"Explore URL for more details: {gap['rationale']}"
+                    )
+                )
+        
+        # 4. Check if we should terminate research
+        if self._should_terminate(context):
+            decisions.append(
+                ResearchDecision(
+                    decision_type=DecisionType.TERMINATE,
+                    priority=1.0,
+                    context={},
+                    rationale="Research question appears to be sufficiently answered"
                 )
             )
-            
-        # Analyze explored content
-        if explored_content:
-            decisions.extend(
-                self._create_analysis_decisions(
-                    content_items=explored_content,
-                    content_type="url_content",
-                    base_priority=0.8
-                )
-            )
-            
+        
         return decisions
         
     def can_handle(self, decision: ResearchDecision) -> bool:
@@ -120,13 +185,8 @@ class ReasoningAgent(BaseAgent):
         
     def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
         """
-        Execute a reasoning decision.
-        
-        Args:
-            decision: Reasoning decision to execute
-            
-        Returns:
-            Analysis results and insights
+        Execute a reasoning decision using deepseek-reasoner.
+        Potentially split content into multiple chunks and run them in parallel, then merge.
         """
         start_time = time.time()
         success = False
@@ -135,21 +195,35 @@ class ReasoningAgent(BaseAgent):
         try:
             content = decision.context["content"]
             content_type = decision.context["content_type"]
+            item_id = decision.context["item_id"]
             
-            # Check if content needs chunking
-            if len(content.split()) > self.chunk_size:
-                results = self._parallel_analyze_content(content, content_type)
+            # Convert content to string for token counting
+            content_str = str(content)
+            tokens_estimated = len(content_str) // 4
+            
+            if tokens_estimated > self.max_tokens_per_call:
+                # Chunked parallel analysis
+                chunk_results = self._parallel_analyze_content(content_str, content_type)
+                combined = self._combine_chunk_results(chunk_results)
+                results = combined
             else:
-                results = self._analyze_content_chunk(content, content_type)
-                
+                # Single chunk
+                single_result = self._analyze_content_chunk(content_str, content_type)
+                results = single_result
+            
             success = bool(results.get("analysis"))
+            
+            # Tag the original content item as "analyzed_by_reasoner"
+            decision.context["analyzed_by_reasoner"] = True
+            results["analyzed_item_id"] = item_id
+            
             if success:
-                rprint(f"[green]Analysis completed for {content_type}[/green]")
+                rprint(f"[green]ReasoningAgent: Analysis completed for content type '{content_type}'[/green]")
             else:
-                rprint(f"[yellow]No analysis generated for {content_type}[/yellow]")
+                rprint(f"[yellow]ReasoningAgent: No analysis produced for '{content_type}'[/yellow]")
                 
         except Exception as e:
-            rprint(f"[red]Analysis error: {str(e)}[/red]")
+            rprint(f"[red]ReasoningAgent error: {str(e)}[/red]")
             results = {
                 "error": str(e),
                 "analysis": "",
@@ -159,132 +233,63 @@ class ReasoningAgent(BaseAgent):
         finally:
             execution_time = time.time() - start_time
             self.log_decision(decision, success, execution_time)
-            
+        
         return results
         
-    def _create_analysis_decisions(
-        self,
-        content_items: List[ContentItem],
-        content_type: str,
-        base_priority: float
-    ) -> List[ResearchDecision]:
+    def _parallel_analyze_content(self, content: str, content_type: str) -> List[Dict[str, Any]]:
         """
-        Create analysis decisions for content items.
-        
-        Args:
-            content_items: Content items to analyze
-            content_type: Type of content being analyzed
-            base_priority: Base priority for these items
-            
-        Returns:
-            List of analysis decisions
+        Splits large text into ~64k token chunks, then spawns parallel requests to deepseek-reasoner.
         """
-        decisions = []
-        
-        for item in content_items:
-            # Skip if priority too low
-            if item.priority * base_priority < self.min_priority:
-                continue
-                
-            decisions.append(
-                ResearchDecision(
-                    decision_type=DecisionType.REASON,
-                    priority=item.priority * base_priority,
-                    context={
-                        "content": item.content,
-                        "content_type": content_type,
-                        "metadata": item.metadata
-                    },
-                    rationale=f"Analyze {content_type} content"
-                )
-            )
-            
-        return decisions
-        
-    def _parallel_analyze_content(
-        self,
-        content: str,
-        content_type: str
-    ) -> Dict[str, Any]:
-        """
-        Analyze large content in parallel chunks.
-        
-        Args:
-            content: Content to analyze
-            content_type: Type of content being analyzed
-            
-        Returns:
-            Combined analysis results
-        """
-        # Split content into chunks
         words = content.split()
+        chunk_size_words = self.max_tokens_per_call * 4  # approximate word limit
         chunks = []
-        current_chunk = []
         
-        for word in words:
-            current_chunk.append(word)
-            if len(current_chunk) >= self.chunk_size:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = []
-                
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-            
-        # Analyze chunks in parallel
+        idx = 0
+        while idx < len(words):
+            chunk = words[idx: idx + chunk_size_words]
+            chunks.append(" ".join(chunk))
+            idx += chunk_size_words
+        
         chunk_results = []
         with ThreadPoolExecutor(max_workers=self.max_parallel_tasks) as executor:
-            future_to_chunk = {
-                executor.submit(
-                    self._analyze_content_chunk,
-                    chunk,
-                    f"{content_type}_chunk_{i}"
-                ): i
+            future_map = {
+                executor.submit(self._analyze_content_chunk, chunk, f"{content_type}_chunk_{i}"): i
                 for i, chunk in enumerate(chunks)
             }
-            
-            for future in as_completed(future_to_chunk):
-                chunk_index = future_to_chunk[future]
+            for future in as_completed(future_map):
+                chunk_index = future_map[future]
                 try:
-                    result = future.result()
-                    result["chunk_index"] = chunk_index
-                    chunk_results.append(result)
+                    res = future.result()
+                    res["chunk_index"] = chunk_index
+                    chunk_results.append(res)
                 except Exception as e:
-                    rprint(f"[red]Error in chunk {chunk_index}: {str(e)}[/red]")
-                    
-        # Combine chunk results
-        return self._combine_chunk_results(chunk_results)
+                    rprint(f"[red]Error in chunk {chunk_index}: {e}[/red]")
         
-    def _analyze_content_chunk(
-        self,
-        content: str,
-        content_type: str
-    ) -> Dict[str, Any]:
+        return chunk_results
+        
+    def _analyze_content_chunk(self, content: str, content_type: str) -> Dict[str, Any]:
         """
-        Analyze a single chunk of content using DeepSeek.
-        
-        Args:
-            content: Content chunk to analyze
-            content_type: Type of content being analyzed
-            
-        Returns:
-            Analysis results for this chunk
+        Calls deepseek to analyze a single chunk of content.
         """
         try:
             response = self.deepseek_client.chat.completions.create(
                 model="deepseek-reasoner",
-                messages=[{
-                    "role": "system",
-                    "content": (
-                        "You are an expert research analyst. Analyze the following "
-                        "content and extract key insights, patterns, and implications."
-                    )
-                }, {
-                    "role": "user",
-                    "content": f"Content type: {content_type}\n\nContent:\n{content}"
-                }],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an advanced deepseek-reasoner model. "
+                            "Analyze the content for key insights, patterns, or relevant facts. "
+                            "You can elaborate on major findings."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Content type: {content_type}\n\nContent:\n{content}"
+                    }
+                ],
                 temperature=0.7
             )
-            
             analysis = response.choices[0].message.content
             
             return {
@@ -292,7 +297,6 @@ class ReasoningAgent(BaseAgent):
                 "insights": self._extract_insights(analysis),
                 "content_type": content_type
             }
-            
         except Exception as e:
             rprint(f"[red]DeepSeek API error: {str(e)}[/red]")
             return {
@@ -302,63 +306,136 @@ class ReasoningAgent(BaseAgent):
                 "error": str(e)
             }
             
-    def _combine_chunk_results(
-        self,
-        chunk_results: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
+    def _extract_insights(self, analysis: str) -> List[str]:
         """
-        Combine results from multiple analyzed chunks.
+        Basic extraction of bullet points or numbered lines from the analysis text.
+        """
+        lines = analysis.split("\n")
+        insights = []
         
-        Args:
-            chunk_results: List of chunk analysis results
-            
-        Returns:
-            Combined analysis
+        for line in lines:
+            line = line.strip()
+            # Look for bullet or numbered items
+            if (line.startswith("-") or line.startswith("*") or 
+                line.startswith("•") or (line[:2].isdigit() and line[2] in [".", ")"])):
+                insights.append(line.lstrip("-*•").strip())
+        
+        return insights
+        
+    def _combine_chunk_results(self, chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        # Sort chunks by index
+        Merges analysis from multiple chunk results into a single structure.
+        """
         sorted_chunks = sorted(chunk_results, key=lambda x: x.get("chunk_index", 0))
         
-        # Combine analyses
-        combined_analysis = "\n\n".join(
-            chunk["analysis"] for chunk in sorted_chunks
-            if chunk.get("analysis")
-        )
+        combined_analysis = "\n\n".join([res["analysis"] for res in sorted_chunks if res["analysis"]])
+        combined_insights = []
+        for res in sorted_chunks:
+            combined_insights.extend(res.get("insights", []))
         
-        # Merge insights
-        all_insights = []
-        for chunk in sorted_chunks:
-            all_insights.extend(chunk.get("insights", []))
-            
-        # Remove duplicates while preserving order
-        unique_insights = list(dict.fromkeys(all_insights))
+        # Remove duplicates
+        unique_insights = list(dict.fromkeys(combined_insights))
         
         return {
             "analysis": combined_analysis,
             "insights": unique_insights,
             "chunk_count": len(chunk_results)
         }
-        
-    def _extract_insights(self, analysis: str) -> List[str]:
+
+    def _identify_knowledge_gaps(
+        self,
+        question: str,
+        current_analysis: str
+    ) -> List[Dict[str, Any]]:
         """
-        Extract key insights from an analysis.
-        
-        Args:
-            analysis: Analysis text to process
+        Analyze current findings to identify what information is still missing.
+        Uses deepseek to compare the question against current analysis.
+        """
+        try:
+            response = self.deepseek_client.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an advanced research analyst. "
+                            "Compare the research question against current findings "
+                            "to identify what key information is still missing. "
+                            "Return a JSON array of knowledge gaps, where each gap has:"
+                            "- type: 'search' or 'explore'"
+                            "- query: search query to fill gap (if type=search)"
+                            "- url: URL to explore (if type=explore)"
+                            "- rationale: why this information is needed"
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Question: {question}\n\nCurrent Analysis:\n{current_analysis}"
+                    }
+                ],
+                temperature=0.7
+            )
             
-        Returns:
-            List of extracted insights
-        """
-        # TODO: Use more sophisticated insight extraction
-        # For now, split on newlines and filter
-        lines = analysis.split("\n")
-        insights = []
-        
-        for line in lines:
-            line = line.strip()
-            # Look for bullet points or numbered items
-            if line.startswith(("-", "*", "•")) or (
-                len(line) > 2 and line[0].isdigit() and line[1] == "."
-            ):
-                insights.append(line.lstrip("- *•").strip())
+            # Parse the response into a list of gaps
+            try:
+                import json
+                gaps = json.loads(response.choices[0].message.content)
+                if isinstance(gaps, list):
+                    return gaps
+            except:
+                # If parsing fails, return an empty list
+                return []
                 
-        return insights
+        except Exception as e:
+            rprint(f"[red]Error identifying knowledge gaps: {e}[/red]")
+            return []
+    
+    def _should_terminate(self, context: ResearchContext) -> bool:
+        """
+        Decide if we have sufficient information to answer the question.
+        """
+        # Get all analysis content
+        analysis_items = context.get_content("main", ContentType.ANALYSIS)
+        if not analysis_items:
+            return False
+        
+        # Combine all analysis
+        combined_analysis = " ".join(str(a.content) for a in analysis_items)
+        
+        try:
+            # Ask deepseek if we have enough info
+            response = self.deepseek_client.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a research completion analyst. "
+                            "Evaluate if we have sufficient information to answer "
+                            "the original question. Consider:"
+                            "1. Are all key aspects addressed?"
+                            "2. Is the information detailed enough?"
+                            "3. Are there any major gaps?"
+                            "Return a JSON with:"
+                            "- complete: true/false"
+                            "- confidence: 0-1"
+                            "- missing: list of missing elements (if any)"
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Question: {context.initial_question}\n\nFindings:\n{combined_analysis}"
+                    }
+                ],
+                temperature=0.7
+            )
+            
+            try:
+                result = json.loads(response.choices[0].message.content)
+                return result.get("complete", False) and result.get("confidence", 0) >= 0.8
+            except:
+                return False
+                
+        except Exception as e:
+            rprint(f"[red]Error checking termination: {e}[/red]")
+            return False

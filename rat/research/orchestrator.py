@@ -147,71 +147,51 @@ class ResearchOrchestrator:
     def _run_iteration(self, iteration_number: int) -> ResearchIteration:
         """
         Run one iteration of the research process.
-        
-        Args:
-            iteration_number: Current iteration number
-            
-        Returns:
-            Results of this iteration
+        The ReasoningAgent is the primary driver, deciding what steps to take next.
+        Other agents act as tools that the ReasoningAgent can command.
         """
         iteration_start = time.time()
-        decisions_made = []
+        all_decisions = []
         content_added = []
         
         try:
-            # 1. Get decisions from all agents
-            all_decisions = self._gather_agent_decisions()
+            # Step 1: The ReasoningAgent is the main driver - get its decisions first
+            reason_decisions = self.reason_agent.analyze(self.current_context)
             
-            # 2. Sort decisions by priority
-            sorted_decisions = sorted(
-                all_decisions,
-                key=lambda d: d.priority,
-                reverse=True
-            )
+            # If the ReasoningAgent says "terminate", we gather that decision and skip everything else
+            if any(d.decision_type == DecisionType.TERMINATE for d in reason_decisions):
+                all_decisions.extend(reason_decisions)
+            else:
+                # Step 2: Also gather decisions from other agents if needed
+                # These are "optional" decisions that might complement the ReasoningAgent's plan
+                search_decisions = self.search_agent.analyze(self.current_context)
+                explore_decisions = self.explore_agent.analyze(self.current_context)
+                execute_decisions = self.execute_agent.analyze(self.current_context)
+                
+                # Combine them all, with ReasoningAgent's decisions first
+                all_decisions = reason_decisions + search_decisions + explore_decisions + execute_decisions
             
-            # 3. Execute decisions
+            # Step 3: Sort decisions by priority
+            sorted_decisions = sorted(all_decisions, key=lambda d: d.priority, reverse=True)
+            
+            # Step 4: Execute decisions
             for decision in sorted_decisions:
+                # If a TERMINATE decision was found, skip further tasks
+                if decision.decision_type == DecisionType.TERMINATE:
+                    break
+                
                 agent = self._get_agent_for_decision(decision)
                 if agent:
                     try:
                         result = agent.execute_decision(decision)
-                        decisions_made.append(decision)
                         
-                        # Add results to context
+                        # Add results to context if we got any
                         if result:
-                            # Process result based on decision type
-                            if decision.decision_type == DecisionType.SEARCH:
-                                # For search results, extract content and urls
-                                content_str = result.get('content', '')
-                                urls = result.get('urls', [])
-                                token_count = self.current_context._estimate_tokens(content_str)
-                                
-                                content_item = ContentItem(
-                                    content_type=self._get_content_type(decision),
-                                    content=content_str,
-                                    metadata={
-                                        "decision_type": decision.decision_type.value,
-                                        "iteration": iteration_number,
-                                        "urls": urls
-                                    },
-                                    token_count=token_count,
-                                    priority=decision.priority
-                                )
-                            else:
-                                # For other types, handle as before
-                                content_str = result if isinstance(result, str) else json.dumps(result)
-                                token_count = self.current_context._estimate_tokens(content_str)
-                                
-                                content_item = ContentItem(
-                                    content_type=self._get_content_type(decision),
-                                    content=result,
-                                    metadata={
-                                        "decision_type": decision.decision_type.value,
-                                        "iteration": iteration_number
-                                    },
-                                    token_count=token_count,
-                                    priority=decision.priority
-                                )
+                            content_item = self._create_content_item(
+                                decision=decision,
+                                result=result,
+                                iteration_number=iteration_number
+                            )
                             self.current_context.add_content("main", content_item=content_item)
                             content_added.append(content_item)
                             
@@ -224,17 +204,77 @@ class ResearchOrchestrator:
         # Calculate iteration metrics
         metrics = {
             "iteration_time": time.time() - iteration_start,
-            "decisions_made": len(decisions_made),
+            "decisions_made": len(all_decisions),
             "content_added": len(content_added),
             "agent_metrics": self._get_agent_metrics()
         }
         
         return ResearchIteration(
             iteration_number=iteration_number,
-            decisions_made=decisions_made,
+            decisions_made=all_decisions,
             content_added=content_added,
             metrics=metrics
         )
+
+    def _create_content_item(
+        self,
+        decision: ResearchDecision,
+        result: Dict[str, Any],
+        iteration_number: int
+    ) -> ContentItem:
+        """Helper to create a ContentItem from a decision result."""
+        if decision.decision_type == DecisionType.SEARCH:
+            # For search results, extract content and urls
+            content_str = result.get('content', '')
+            urls = result.get('urls', [])
+            token_count = self.current_context._estimate_tokens(content_str)
+            
+            return ContentItem(
+                content_type=self._get_content_type(decision),
+                content=content_str,
+                metadata={
+                    "decision_type": decision.decision_type.value,
+                    "iteration": iteration_number,
+                    "urls": urls
+                },
+                token_count=token_count,
+                priority=decision.priority
+            )
+        else:
+            # For other types, handle as before
+            content_str = result if isinstance(result, str) else json.dumps(result)
+            token_count = self.current_context._estimate_tokens(content_str)
+            
+            return ContentItem(
+                content_type=self._get_content_type(decision),
+                content=result,
+                metadata={
+                    "decision_type": decision.decision_type.value,
+                    "iteration": iteration_number
+                },
+                token_count=token_count,
+                priority=decision.priority
+            )
+
+    def _should_terminate(self, iteration: ResearchIteration) -> bool:
+        """
+        Decide if we should break out of the loop.
+        Now primarily driven by the ReasoningAgent's TERMINATE decision.
+        """
+        # 1) If there's a TERMINATE decision from the ReasoningAgent
+        terminate_decision = any(
+            d.decision_type == DecisionType.TERMINATE for d in iteration.decisions_made
+        )
+        if terminate_decision:
+            rprint("[green]Terminating: ReasoningAgent indicated completion.[/green]")
+            return True
+        
+        # 2) Backup: If we got no new content
+        if len(iteration.content_added) < self.min_new_content:
+            rprint("[yellow]Terminating: No further new content was added.[/yellow]")
+            return True
+        
+        return False
         
     def _gather_agent_decisions(self) -> List[ResearchDecision]:
         """
@@ -300,35 +340,6 @@ class ResearchOrchestrator:
         }
         
         return type_map.get(decision.decision_type, ContentType.OTHER)
-        
-    def _should_terminate(self, iteration: ResearchIteration) -> bool:
-        """
-        Check if research should terminate.
-        
-        Args:
-            iteration: Last completed iteration
-            
-        Returns:
-            True if research should stop
-        """
-        # Check if we found enough content
-        if len(iteration.content_added) < self.min_new_content:
-            rprint("[yellow]Terminating: Not enough new content found[/yellow]")
-            return True
-            
-        # Check if we have high confidence results
-        analysis_content = self.current_context.get_content(
-            "main",
-            ContentType.ANALYSIS
-        )
-        if analysis_content:
-            latest = analysis_content[-1]
-            confidence = latest.content.get("confidence", 0)
-            if confidence >= self.min_confidence:
-                rprint("[green]Terminating: Reached confidence threshold[/green]")
-                return True
-                
-        return False
         
     def _generate_final_output(self) -> Dict[str, Any]:
         """

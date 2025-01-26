@@ -36,7 +36,7 @@ class ContentItem:
         id: Unique identifier for this content item
     """
     content_type: ContentType
-    content: str
+    content: Any
     metadata: Dict[str, Any]
     token_count: int
     priority: float = 0.5
@@ -120,7 +120,7 @@ class ResearchContext:
                    branch_id: str,
                    content_item: Optional[ContentItem] = None,
                    content_type: Optional[ContentType] = None,
-                   content: Optional[str] = None,
+                   content: Optional[Any] = None,
                    metadata: Optional[Dict[str, Any]] = None,
                    token_count: Optional[int] = None,
                    priority: float = 0.5) -> ContentItem:
@@ -131,17 +131,7 @@ class ResearchContext:
         1. branch_id and content_item
         2. branch_id and individual parameters (content_type, content, metadata, etc.)
         
-        Args:
-            branch_id: Branch to add content to
-            content_item: Pre-constructed ContentItem (if provided, other params are ignored)
-            content_type: Type of content being added
-            content: The content text/data
-            metadata: Additional content metadata
-            token_count: Pre-computed token count (if available)
-            priority: Priority of this content (0-1), defaults to 0.5
-            
-        Returns:
-            The created/added content item
+        Raises ValueError if adding content would exceed the per-branch token limit.
         """
         if branch_id not in self.branches:
             raise ValueError(f"Branch {branch_id} not found")
@@ -150,33 +140,35 @@ class ResearchContext:
         
         if content_item:
             item = content_item
-            token_count = item.token_count
+            token_usage = item.token_count
         else:
             if content_type is None or content is None or metadata is None:
                 raise ValueError("Must provide either content_item or all of: content_type, content, metadata")
                 
             # Estimate tokens if not provided
             if token_count is None:
-                token_count = self._estimate_tokens(content)
+                token_usage = self._estimate_tokens(str(content))
+            else:
+                token_usage = token_count
                 
             # Create new content item
             item = ContentItem(
                 content_type=content_type,
                 content=content,
                 metadata=metadata,
-                token_count=token_count,
+                token_count=token_usage,
                 priority=priority
             )
             
         # Check token limit
-        if branch.token_count + token_count > self.MAX_TOKENS_PER_BRANCH:
+        if branch.token_count + token_usage > self.MAX_TOKENS_PER_BRANCH:
             raise ValueError(
                 f"Adding this content would exceed the token limit "
                 f"({self.MAX_TOKENS_PER_BRANCH}) for branch {branch_id}"
             )
             
         branch.content_items.append(item)
-        branch.token_count += token_count
+        branch.token_count += token_usage
         
         return item
     
@@ -221,14 +213,7 @@ class ResearchContext:
                    branch_id: str,
                    content_type: Optional[ContentType] = None) -> List[ContentItem]:
         """
-        Get content items from a specific branch.
-        
-        Args:
-            branch_id: Branch to get content from
-            content_type: Optional filter by content type
-            
-        Returns:
-            List of matching content items
+        Get content items from a specific branch, optionally filtered by ContentType.
         """
         if branch_id not in self.branches:
             raise ValueError(f"Branch {branch_id} not found")
@@ -243,22 +228,13 @@ class ResearchContext:
     def _estimate_tokens(self, content: str) -> int:
         """
         Estimate the number of tokens in a piece of content.
-        
-        Args:
-            content: Text content to analyze
-            
-        Returns:
-            Estimated token count
+        Simple approximation: ~4 characters per token.
         """
-        # Simple estimation: ~4 characters per token
         return len(content) // 4
     
     def to_dict(self) -> Dict[str, Any]:
         """
         Convert the context to a dictionary for serialization.
-        
-        Returns:
-            Dictionary representation of the context
         """
         return {
             "initial_question": self.initial_question,
@@ -292,12 +268,6 @@ class ResearchContext:
     def from_dict(cls, data: Dict[str, Any]) -> 'ResearchContext':
         """
         Create a context instance from a dictionary.
-        
-        Args:
-            data: Dictionary representation of a context
-            
-        Returns:
-            New ResearchContext instance
         """
         context = cls(data["initial_question"])
         context.version = data["version"]

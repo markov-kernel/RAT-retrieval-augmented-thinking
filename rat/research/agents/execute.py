@@ -1,5 +1,5 @@
 """
-Execution agent for generating code and structured output using Claude.
+Execution agent for generating code and structured output using Claude (claude-3-5-sonnet-20241022).
 Handles code generation, data formatting, and output validation.
 """
 
@@ -34,8 +34,7 @@ class ExecutionTask:
 class ExecutionAgent(BaseAgent):
     """
     Agent responsible for generating code and structured output using Claude.
-    
-    Handles code generation, data formatting, and output validation.
+    Uses the model 'claude-3-5-sonnet-20241022' by default for code or JSON output.
     """
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -62,53 +61,51 @@ class ExecutionAgent(BaseAgent):
         
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
         """
-        Analyze the research context and decide on execution tasks.
+        Scan the research context for content that might need code generation
+        or structured output, generating new EXECUTE decisions if needed.
         
-        Args:
-            context: Current research context
-            
         Returns:
-            List of execution-related decisions
+            List of EXECUTE decisions
         """
         decisions = []
         
-        # Get analyzed content that might need structured output
-        analyzed_content = context.get_content(
-            "main",
-            ContentType.ANALYSIS
-        )
+        # Example heuristic: If the ReasoningAgent's analysis mentions
+        # "Generate code" or "structured JSON," propose an EXECUTE decision.
+        analysis_content = context.get_content("main", ContentType.ANALYSIS)
         
-        for content in analyzed_content:
-            # Check if content needs code generation
-            if self._needs_code_generation(content):
+        for content_item in analysis_content:
+            text_lower = str(content_item.content).lower()
+            
+            # If the analysis suggests code
+            if "generate code" in text_lower or "implementation" in text_lower:
                 decisions.append(
                     ResearchDecision(
                         decision_type=DecisionType.EXECUTE,
-                        priority=content.priority * 0.9,
+                        priority=content_item.priority,
                         context={
                             "task_type": "code",
-                            "content": content.content,
-                            "metadata": content.metadata
+                            "content": str(content_item.content),
+                            "metadata": content_item.metadata
                         },
-                        rationale="Generate code implementation"
+                        rationale="Generating code from analysis"
                     )
                 )
-                
-            # Check if content needs JSON formatting
-            if self._needs_json_formatting(content):
+            
+            # If the analysis suggests structured JSON
+            if "structured json" in text_lower or "format json" in text_lower:
                 decisions.append(
                     ResearchDecision(
                         decision_type=DecisionType.EXECUTE,
-                        priority=content.priority * 0.8,
+                        priority=content_item.priority,
                         context={
                             "task_type": "json",
-                            "content": content.content,
-                            "metadata": content.metadata
+                            "content": str(content_item.content),
+                            "metadata": content_item.metadata
                         },
-                        rationale="Convert analysis to structured JSON"
+                        rationale="Converting analysis to structured JSON"
                     )
                 )
-                
+        
         return decisions
         
     def can_handle(self, decision: ResearchDecision) -> bool:
@@ -151,7 +148,7 @@ class ExecutionAgent(BaseAgent):
                 rationale=decision.rationale
             )
             
-            # Execute with retries
+            # Attempt generation
             for attempt in range(self.max_retries + 1):
                 try:
                     if task_type == "code":
@@ -163,17 +160,16 @@ class ExecutionAgent(BaseAgent):
                         
                     success = True
                     break
-                    
                 except Exception as e:
                     if attempt == self.max_retries:
                         raise
-                    rprint(f"[yellow]Attempt {attempt + 1} failed: {str(e)}[/yellow]")
-                    time.sleep(1)  # Brief delay before retry
+                    rprint(f"[yellow]Execution attempt {attempt+1} failed: {e}[/yellow]")
+                    time.sleep(1)
                     
             if success:
-                rprint(f"[green]{task_type.title()} generation completed[/green]")
+                rprint(f"[green]ExecutionAgent: {task_type} generation succeeded[/green]")
             else:
-                rprint(f"[yellow]No output generated for {task_type}[/yellow]")
+                rprint(f"[yellow]ExecutionAgent: no output generated for {task_type}[/yellow]")
                 
         except Exception as e:
             rprint(f"[red]Execution error: {str(e)}[/red]")
@@ -191,82 +187,26 @@ class ExecutionAgent(BaseAgent):
             
         return results
         
-    def _needs_code_generation(self, content: ContentItem) -> bool:
-        """
-        Check if content needs code generation.
-        
-        Args:
-            content: Content item to check
-            
-        Returns:
-            True if code generation is needed
-        """
-        # Look for code-related keywords
-        code_indicators = [
-            "implementation",
-            "code",
-            "function",
-            "class",
-            "algorithm",
-            "script"
+    def _generate_code(self, content: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert code generator. Generate clean, efficient, "
+                    "and well-documented code based on the provided description."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Generate code for:\n\n{content}"
+            }
         ]
-        
-        text = content.content.lower()
-        return any(indicator in text for indicator in code_indicators)
-        
-    def _needs_json_formatting(self, content: ContentItem) -> bool:
-        """
-        Check if content needs JSON formatting.
-        
-        Args:
-            content: Content item to check
-            
-        Returns:
-            True if JSON formatting is needed
-        """
-        # Look for structured data indicators
-        json_indicators = [
-            "structured",
-            "json",
-            "data format",
-            "schema",
-            "key-value",
-            "mapping"
-        ]
-        
-        text = content.content.lower()
-        return any(indicator in text for indicator in json_indicators)
-        
-    def _generate_code(
-        self,
-        content: str,
-        metadata: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Generate code using Claude.
-        
-        Args:
-            content: Content to generate code from
-            metadata: Additional context
-            
-        Returns:
-            Generated code and metadata
-        """
-        messages = [{
-            "role": "system",
-            "content": (
-                "You are an expert code generator. Generate clean, efficient, "
-                "and well-documented code based on the provided description."
-            )
-        }, {
-            "role": "user",
-            "content": f"Generate code for:\n\n{content}"
-        }]
         
         response = self.claude_client.messages.create(
             model=self.model,
             messages=messages,
-            max_tokens=4000
+            max_tokens=4000,
+            temperature=0.7
         )
         
         generated_code = response.content[0].text
@@ -277,41 +217,30 @@ class ExecutionAgent(BaseAgent):
             "metadata": metadata
         }
         
-    def _format_json(
-        self,
-        content: str,
-        metadata: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Convert content to structured JSON using Claude.
-        
-        Args:
-            content: Content to convert to JSON
-            metadata: Additional context
-            
-        Returns:
-            Formatted JSON and metadata
-        """
-        messages = [{
-            "role": "system",
-            "content": (
-                "You are an expert at converting unstructured text into clean, "
-                "well-structured JSON format."
-            )
-        }, {
-            "role": "user",
-            "content": f"Convert to JSON:\n\n{content}"
-        }]
+    def _format_json(self, content: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert at converting unstructured text into clean, "
+                    "well-structured JSON format."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Convert to JSON:\n\n{content}"
+            }
+        ]
         
         response = self.claude_client.messages.create(
             model=self.model,
             messages=messages,
-            max_tokens=4000
+            max_tokens=4000,
+            temperature=0.7
         )
         
         json_str = response.content[0].text
         
-        # Validate JSON
         try:
             json_data = json.loads(json_str)
             return {
@@ -332,17 +261,14 @@ class ExecutionAgent(BaseAgent):
         Returns:
             Detected language name
         """
-        # TODO: Implement smarter language detection
-        # For now, use simple keyword matching
+        # Basic detection
         language_indicators = {
             "python": ["def ", "import ", "class ", "print("],
             "javascript": ["function", "const ", "let ", "var "],
             "java": ["public class", "private ", "void ", "String"],
             "cpp": ["#include", "int main", "std::", "void"]
         }
-        
         for lang, indicators in language_indicators.items():
             if any(indicator in code for indicator in indicators):
                 return lang
-                
         return "unknown"
