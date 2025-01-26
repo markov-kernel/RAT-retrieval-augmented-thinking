@@ -33,6 +33,7 @@ class ResearchIteration:
         decisions_made: List of decisions made
         content_added: New content items added
         metrics: Performance metrics for this iteration
+        timestamp: float - when the iteration occurred
     """
     iteration_number: int
     decisions_made: List[ResearchDecision]
@@ -75,15 +76,15 @@ class ResearchOrchestrator:
             {
                 **(self.config.get("explore_config") or {}),
                 "max_workers": self.config.get("max_parallel_explores", 10),
-                "rate_limit": self.config.get("explore_rate_limit", 100)
+                "rate_limit": self.config.get("explore_rate_limit", 50)
             }
         )
-        # Use 10 RPM limit for Gemini
         self.reason_agent = ReasoningAgent(
             {
                 **(self.config.get("reason_config") or {}),
                 "max_workers": self.config.get("max_parallel_reason", 5),
-                "rate_limit": self.config.get("reason_rate_limit", 10)  # 10 requests/min
+                "rate_limit": self.config.get("reason_rate_limit", 10),
+                "flash_fix_rate_limit": self.config.get("flash_fix_rate_limit", 10)
             }
         )
         
@@ -99,6 +100,9 @@ class ResearchOrchestrator:
         self.current_context: Optional[ResearchContext] = None
         self.iterations: List[ResearchIteration] = []
         self.research_dir: Optional[Path] = None
+        
+        # Keep track of previously executed search queries to avoid duplicates
+        self.previous_searches = set()
         
     def start_research(self, question: str) -> Dict[str, Any]:
         """
@@ -160,60 +164,73 @@ class ResearchOrchestrator:
     def _run_iteration(self, iteration_number: int) -> ResearchIteration:
         """
         Run one iteration of the research process.
-        The ReasoningAgent is the primary driver, deciding what steps to take next.
-        Other agents act as tools that the ReasoningAgent can command.
+        The ReasoningAgent is the main driver, deciding next steps.
+        Other agents can also propose decisions.
         """
         iteration_start = time.time()
         all_decisions = []
         content_added = []
         
         try:
-            # Step 1: The ReasoningAgent is the main driver - get its decisions first
+            # 1) ReasoningAgent - the main driver
             reason_decisions = self.reason_agent.analyze(self.current_context)
             
-            # If the ReasoningAgent says "terminate", we gather that decision and skip everything else
+            # If the ReasoningAgent says "terminate", gather that decision and skip everything
             if any(d.decision_type == DecisionType.TERMINATE for d in reason_decisions):
                 all_decisions.extend(reason_decisions)
             else:
-                # Step 2: Also gather decisions from other agents if needed
-                # These are "optional" decisions that might complement the ReasoningAgent's plan
+                # 2) Also gather decisions from other agents
                 search_decisions = self.search_agent.analyze(self.current_context)
                 explore_decisions = self.explore_agent.analyze(self.current_context)
                 
-                # Combine them all, with ReasoningAgent's decisions first
+                # Combine them all
                 all_decisions = reason_decisions + search_decisions + explore_decisions
             
-            # Step 3: Sort decisions by priority
+            # 3) Sort decisions by priority
             sorted_decisions = sorted(all_decisions, key=lambda d: d.priority, reverse=True)
             
-            # Step 4: Execute decisions
+            # 4) Execute decisions, skipping duplicates for SEARCH
             for decision in sorted_decisions:
-                # If a TERMINATE decision was found, skip further tasks
                 if decision.decision_type == DecisionType.TERMINATE:
+                    # If we see a TERMINATE decision, do not continue
                     break
                 
                 agent = self._get_agent_for_decision(decision)
-                if agent:
-                    try:
-                        result = agent.execute_decision(decision)
+                if not agent:
+                    continue
+                
+                if decision.decision_type == DecisionType.SEARCH:
+                    # Check for duplicates
+                    query_str = decision.context.get("query", "").strip()
+                    if not query_str:
+                        continue
+                    
+                    if query_str in self.previous_searches:
+                        rprint(f"[yellow]Skipping duplicate search: '{query_str}'[/yellow]")
+                        continue
+                    else:
+                        self.previous_searches.add(query_str)
+                
+                # Now actually execute
+                try:
+                    result = agent.execute_decision(decision)
+                    
+                    # Add results to context if we got any
+                    if result:
+                        content_item = self._create_content_item(
+                            decision=decision,
+                            result=result,
+                            iteration_number=iteration_number
+                        )
+                        self.current_context.add_content("main", content_item=content_item)
+                        content_added.append(content_item)
                         
-                        # Add results to context if we got any
-                        if result:
-                            content_item = self._create_content_item(
-                                decision=decision,
-                                result=result,
-                                iteration_number=iteration_number
-                            )
-                            self.current_context.add_content("main", content_item=content_item)
-                            content_added.append(content_item)
-                            
-                    except Exception as e:
-                        rprint(f"[red]Error executing decision: {str(e)}[/red]")
+                except Exception as e:
+                    rprint(f"[red]Error executing decision: {str(e)}[/red]")
                         
         except Exception as e:
             rprint(f"[red]Iteration error: {str(e)}[/red]")
             
-        # Calculate iteration metrics
         metrics = {
             "iteration_time": time.time() - iteration_start,
             "decisions_made": len(all_decisions),

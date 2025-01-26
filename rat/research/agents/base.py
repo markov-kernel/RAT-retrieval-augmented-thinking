@@ -12,6 +12,9 @@ from rich import print as rprint
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 class DecisionType(Enum):
     """Types of decisions an agent can make during research."""
@@ -78,9 +81,35 @@ class BaseAgent(ABC):
         self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
         self._active_tasks: Set[str] = set()
         self._tasks_lock = threading.Lock()
-        self._last_request_time = 0
+        self._last_request_time = 0.0
         self._rate_limit_lock = threading.Lock()
+        
+        # Initialize logger
+        self.logger = logging.getLogger(f"{__name__}.{name}")
     
+    def _enforce_rate_limit(self):
+        """
+        Ensure we do not exceed self.rate_limit requests per minute.
+        We'll do a simple 'sleep' if we haven't waited long enough
+        since the last request.
+        """
+        if self.rate_limit <= 0:
+            return  # no limiting
+            
+        with self._rate_limit_lock:
+            current_time = time.time()
+            elapsed = current_time - self._last_request_time
+            
+            # requests-per-minute => min interval
+            min_interval = 60.0 / self.rate_limit
+            
+            if elapsed < min_interval:
+                sleep_time = min_interval - elapsed
+                time.sleep(sleep_time)
+                self.metrics["rate_limit_delays"] += 1
+            
+            self._last_request_time = time.time()
+            
     @abstractmethod
     def analyze(self, context: 'ResearchContext') -> List[ResearchDecision]:
         """

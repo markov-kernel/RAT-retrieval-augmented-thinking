@@ -9,8 +9,12 @@ from typing import Dict, Any
 from dotenv import load_dotenv
 from rich import print as rprint
 from firecrawl import FirecrawlApp
+import logging
 
 load_dotenv()
+
+# Get API logger
+api_logger = logging.getLogger('api.firecrawl')
 
 class FirecrawlClient:
     def __init__(self):
@@ -19,6 +23,7 @@ class FirecrawlClient:
             raise ValueError("FIRECRAWL_API_KEY not found in environment variables")
         
         self.app = FirecrawlApp(api_key=self.api_key)
+        self.logger = logging.getLogger(__name__)
         
     def extract_content(self, url: str) -> Dict[str, Any]:
         """
@@ -30,10 +35,13 @@ class FirecrawlClient:
         Returns:
             Dict containing extracted content and metadata
         """
+        api_logger.info(f"Firecrawl API Request - URL: {url}")
+        
         try:
             # Ensure URL has protocol
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
+                api_logger.debug(f"Added https:// protocol to URL: {url}")
             
             # Make the request to scrape the URL
             result = self.app.scrape_url(
@@ -43,10 +51,12 @@ class FirecrawlClient:
                 }
             )
             
-            return self._process_extracted_content(result.get('data', {}), url)
+            processed_result = self._process_extracted_content(result.get('data', {}), url)
+            api_logger.debug(f"Processed content from {url}: {len(processed_result.get('text', ''))} chars")
+            return processed_result
             
         except Exception as e:
-            rprint(f"[red]Firecrawl API request failed for {url}: {str(e)}[/red]")
+            api_logger.error(f"Firecrawl API request failed for {url}: {str(e)}")
             return {
                 "title": "",
                 "text": "",
@@ -87,6 +97,9 @@ class FirecrawlClient:
         # Clean and format the text if needed
         if processed["text"]:
             processed["text"] = self._clean_text(processed["text"])
+            api_logger.debug(f"Cleaned text for {original_url}: {len(processed['text'])} chars")
+        else:
+            api_logger.warning(f"No text content extracted from {original_url}")
         
         return processed
         

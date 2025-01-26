@@ -6,6 +6,7 @@ Provides a command-line interface for conducting research using specialized agen
 import os
 import sys
 import json
+import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
@@ -19,6 +20,40 @@ import time
 from .orchestrator import ResearchOrchestrator
 from .output_manager import OutputManager
 
+# Clear existing handlers to avoid duplicate logs
+root_logger = logging.getLogger()
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Configure main application logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('rat.log', mode='w'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Configure API logging
+api_logger = logging.getLogger('api')
+api_logger.setLevel(logging.DEBUG)
+api_handler = logging.FileHandler('rat_api.log', mode='w')
+api_handler.setFormatter(
+    logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+)
+api_logger.addHandler(api_handler)
+
+# Configure Firecrawl API logging
+firecrawl_logger = logging.getLogger('api.firecrawl')
+firecrawl_logger.setLevel(logging.DEBUG)
+firecrawl_logger.addHandler(api_handler)
+firecrawl_logger.propagate = False
+
+# Ensure API logger doesn't propagate to root logger
+api_logger.propagate = False
+
+logger = logging.getLogger(__name__)
 console = Console()
 
 def load_config() -> Dict[str, Any]:
@@ -29,26 +64,32 @@ def load_config() -> Dict[str, Any]:
         'max_iterations': int(os.getenv('MAX_ITERATIONS', '5')),
         'min_new_content': int(os.getenv('MIN_NEW_CONTENT', '3')),
         'min_confidence': float(os.getenv('MIN_CONFIDENCE', '0.7')),
+        
+        # Limit search to 100 requests/min
         'search_config': {
             'max_results': int(os.getenv('MAX_SEARCH_RESULTS', '10')),
             'min_relevance': float(os.getenv('MIN_SEARCH_RELEVANCE', '0.6')),
             'api_key': os.getenv('PERPLEXITY_API_KEY'),
             'max_workers': int(os.getenv('MAX_PARALLEL_SEARCHES', '10')),
-            'rate_limit': int(os.getenv('SEARCH_RATE_LIMIT', '100'))
+            'rate_limit': int(os.getenv('SEARCH_RATE_LIMIT', '100'))  # 100 requests/min for Perplexity
         },
+        # Limit Firecrawl to 50 requests/min
         'explore_config': {
             'max_urls': int(os.getenv('MAX_URLS', '20')),
             'min_priority': float(os.getenv('MIN_URL_PRIORITY', '0.5')),
             'allowed_domains': json.loads(os.getenv('ALLOWED_DOMAINS', '[]')),
             'api_key': os.getenv('FIRECRAWL_API_KEY'),
             'max_workers': int(os.getenv('MAX_PARALLEL_EXPLORES', '10')),
-            'rate_limit': int(os.getenv('EXPLORE_RATE_LIMIT', '100'))
+            'rate_limit': int(os.getenv('EXPLORE_RATE_LIMIT', '50'))  # 50 requests/min for Firecrawl
         },
+        # Limit Gemini "thinking" to 10 requests/min
+        # and "flash" JSON-fixer also 10/min
         'reason_config': {
             'max_chunk_size': int(os.getenv('MAX_CHUNK_SIZE', '4000')),
             'min_confidence': float(os.getenv('MIN_ANALYSIS_CONFIDENCE', '0.7')),
             'max_workers': int(os.getenv('MAX_PARALLEL_REASON', '5')),
-            'rate_limit': int(os.getenv('REASON_RATE_LIMIT', '10')),  # 10 RPM for Gemini
+            'rate_limit': int(os.getenv('REASON_RATE_LIMIT', '10')),  # 10 requests/min for main Gemini
+            'flash_fix_rate_limit': int(os.getenv('FLASH_FIX_RATE_LIMIT', '10')),  # 10/min for JSON-fixing
             'api_key': os.getenv('GEMINI_API_KEY'),
             'gemini_timeout': int(os.getenv('GEMINI_TIMEOUT', '180'))
         }

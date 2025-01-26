@@ -5,9 +5,18 @@ Uses the Perplexity API to perform intelligent web searches and extract relevant
 
 import os
 import re
+import json
+import logging
 from openai import OpenAI
 from typing import List, Dict, Any
 from rich import print as rprint
+from dotenv import load_dotenv
+import httpx
+
+load_dotenv()
+
+# Get API logger
+api_logger = logging.getLogger('api.perplexity')
 
 class PerplexityClient:
     def __init__(self):
@@ -33,6 +42,8 @@ class PerplexityClient:
         Returns:
             Dict containing search results and extracted URLs
         """
+        api_logger.info(f"Perplexity API Request - Query: {query}")
+        
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -47,16 +58,25 @@ class PerplexityClient:
             content = response.choices[0].message.content
             urls = self._extract_urls(content)
             
+            api_logger.debug(f"Response data: {json.dumps({'content': content, 'urls': urls}, indent=2)}")
+            
             return {
                 "content": content,
-                "urls": urls
+                "urls": urls,
+                "query": query,
+                "metadata": {
+                    "model": self.model,
+                    "usage": response.usage
+                }
             }
             
         except Exception as e:
-            rprint(f"[red]Error in Perplexity search: {str(e)}[/red]")
+            api_logger.error(f"Perplexity API error: {str(e)}")
             return {
                 "content": "",
-                "urls": []
+                "urls": [],
+                "query": query,
+                "metadata": {}
             }
             
     def _extract_urls(self, text: str) -> List[str]:
