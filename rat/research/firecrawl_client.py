@@ -2,10 +2,16 @@
 Firecrawl client for web scraping functionality.
 This module handles interactions with the Firecrawl API for extracting content
 from web pages and processing the extracted data.
+
+Key Features:
+1. Single-page extraction (primary /scrape endpoint)
+2. Batch scraping for multiple URLs
+3. Optional LLM-based structured data extraction
+4. Content cleaning and formatting
 """
 
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 from rich import print as rprint
 from firecrawl import FirecrawlApp
@@ -35,7 +41,8 @@ class FirecrawlClient:
         
     def extract_content(self, url: str) -> Dict[str, Any]:
         """
-        Extract content from a webpage using Firecrawl API.
+        Extract content from a single webpage using Firecrawl's /scrape endpoint.
+        This is the primary method for single-page extraction, returning markdown.
         
         Args:
             url: The URL to scrape
@@ -48,22 +55,22 @@ class FirecrawlClient:
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
             
-            logger.info("Extracting content from URL: %s", url)
+            logger.info("Extracting content from URL: %s (single scrape)", url)
             
             # Make the request to scrape the URL with timeout
             result = self.app.scrape_url(
                 url,
                 params={
                     'formats': ['markdown'],
-                    'request_timeout': self.request_timeout  # Pass timeout in params
+                    'request_timeout': self.request_timeout
                 }
             )
             
             return self._process_extracted_content(result.get('data', {}), url)
             
         except Exception as e:
-            rprint(f"[red]Firecrawl API request failed for {url}: {str(e)}[/red]")
-            logger.exception("Error extracting content from URL: %s", url)
+            rprint(f"[red]Firecrawl API request failed (single scrape) for {url}: {str(e)}[/red]")
+            logger.exception("Error extracting content from URL (single scrape): %s", url)
             return {
                 "title": "",
                 "text": "",
@@ -71,6 +78,119 @@ class FirecrawlClient:
                     "url": url,
                     "error": str(e)
                 }
+            }
+
+    def scrape_urls_batch(self, urls: List[str]) -> List[Dict[str, Any]]:
+        """
+        Batch scrape multiple URLs in one Firecrawl call using /batch/scrape.
+        More efficient than multiple single-page scrapes when you have several URLs.
+        
+        Args:
+            urls: List of URLs to scrape
+            
+        Returns:
+            List of processed results, one per URL (preserving order)
+        """
+        if not urls:
+            return []
+            
+        logger.info("Batch-scraping %d URLs", len(urls))
+        
+        try:
+            # Ensure all URLs have protocols
+            urls = [
+                f"https://{url}" if not url.startswith(('http://', 'https://')) else url
+                for url in urls
+            ]
+            
+            # Call Firecrawl batch scrape
+            result = self.app.batch_scrape_urls(
+                urls,
+                params={
+                    'formats': ['markdown'],
+                    'request_timeout': self.request_timeout
+                }
+            )
+            
+            # Process each page in the batch
+            batch_data = result.get('data', [])
+            processed_results = []
+            
+            for page_data in batch_data:
+                # Each page_data is similar to a single scrape result
+                processed = self._process_extracted_content(
+                    page_data,
+                    page_data.get('metadata', {}).get('sourceURL', '')
+                )
+                processed_results.append(processed)
+                
+            return processed_results
+            
+        except Exception as e:
+            rprint(f"[red]Firecrawl batch scrape failed: {str(e)}[/red]")
+            logger.exception("Error in batch_scrape_urls for URLs: %s", urls)
+            # Return empty results for all URLs
+            return [
+                {
+                    "title": "",
+                    "text": "",
+                    "metadata": {
+                        "url": url,
+                        "error": str(e)
+                    }
+                }
+                for url in urls
+            ]
+
+    def extract_data(self, url: str, prompt: str) -> Dict[str, Any]:
+        """
+        Extract structured data from a webpage using Firecrawl's LLM capabilities.
+        Uses the /scrape endpoint with formats=['json'] and a custom prompt.
+        
+        Args:
+            url: The URL to extract data from
+            prompt: Instructions for the LLM about what data to extract
+            
+        Returns:
+            Dict containing the extracted structured data and metadata
+        """
+        try:
+            logger.info(
+                "Extracting structured data from URL: %s with prompt='%s'",
+                url, prompt
+            )
+            
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+            
+            result = self.app.scrape_url(
+                url,
+                params={
+                    'formats': ['json'],
+                    'jsonOptions': {
+                        'prompt': prompt
+                    },
+                    'request_timeout': self.request_timeout
+                }
+            )
+            
+            data = result.get('data', {})
+            extracted = data.get('json', {})
+            meta = data.get('metadata', {})
+            
+            return {
+                'url': meta.get('sourceURL', url),
+                'extracted_fields': extracted,
+                'metadata': meta
+            }
+            
+        except Exception as e:
+            rprint(f"[red]Firecrawl structured extraction failed for {url}: {str(e)}[/red]")
+            logger.exception("Error extracting structured data from URL: %s", url)
+            return {
+                'url': url,
+                'extracted_fields': {},
+                'metadata': {'error': str(e)}
             }
             
     def _process_extracted_content(self, data: Dict[str, Any], original_url: str) -> Dict[str, Any]:
@@ -89,21 +209,17 @@ class FirecrawlClient:
         
         processed = {
             "title": metadata.get("title", metadata.get("ogTitle", "")),
-            "text": markdown_content,
+            "text": self._clean_text(markdown_content),
             "metadata": {
                 "url": metadata.get("sourceURL", original_url),
                 "author": metadata.get("author", ""),
-                "published_date": "",  # Firecrawl doesn't provide this directly
+                "published_date": metadata.get("publishedDate", ""),
                 "domain": metadata.get("ogSiteName", ""),
                 "word_count": len(markdown_content.split()) if markdown_content else 0,
                 "language": metadata.get("language", ""),
                 "status_code": metadata.get("statusCode", 200)
             }
         }
-        
-        # Clean and format the text if needed
-        if processed["text"]:
-            processed["text"] = self._clean_text(processed["text"])
         
         return processed
         

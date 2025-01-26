@@ -232,18 +232,53 @@ class ResearchOrchestrator:
                 priority=decision.priority
             )
         elif decision.decision_type == DecisionType.EXPLORE:
-            content_str = json.dumps(result)
-            token_count = self.current_context._estimate_tokens(content_str)
-            return ContentItem(
-                content_type=ContentType.EXPLORED_CONTENT,
-                content=result,
-                metadata={
-                    "decision_type": decision.decision_type.value,
-                    "iteration": iteration_number
-                },
-                token_count=token_count,
-                priority=decision.priority
-            )
+            # Handle both single-page and batch exploration results
+            if "batch_results" in result:
+                # For batch results, create a combined content item
+                batch_results = result["batch_results"]
+                urls = result.get("urls", [])
+                domain = result.get("domain", "")
+                
+                # Combine the batch results into a single content item
+                combined_content = {
+                    "type": "batch_exploration",
+                    "domain": domain,
+                    "urls": urls,
+                    "results": batch_results
+                }
+                
+                content_str = json.dumps(combined_content)
+                token_count = self.current_context._estimate_tokens(content_str)
+                
+                return ContentItem(
+                    content_type=ContentType.EXPLORED_CONTENT,
+                    content=combined_content,
+                    metadata={
+                        "decision_type": decision.decision_type.value,
+                        "iteration": iteration_number,
+                        "is_batch": True,
+                        "domain": domain,
+                        "url_count": len(urls)
+                    },
+                    token_count=token_count,
+                    priority=decision.priority
+                )
+            else:
+                # Single-page exploration result
+                content_str = json.dumps(result)
+                token_count = self.current_context._estimate_tokens(content_str)
+                return ContentItem(
+                    content_type=ContentType.EXPLORED_CONTENT,
+                    content=result,
+                    metadata={
+                        "decision_type": decision.decision_type.value,
+                        "iteration": iteration_number,
+                        "is_batch": False,
+                        "url": result.get("metadata", {}).get("url", "")
+                    },
+                    token_count=token_count,
+                    priority=decision.priority
+                )
         elif decision.decision_type == DecisionType.REASON:
             content_str = json.dumps(result)
             token_count = self.current_context._estimate_tokens(content_str)
@@ -257,12 +292,11 @@ class ResearchOrchestrator:
                 token_count=token_count,
                 priority=decision.priority
             )
-        else:
-            # TERMINATE or any fallback
+        elif decision.decision_type == DecisionType.TERMINATE:
             content_str = json.dumps(result)
             token_count = self.current_context._estimate_tokens(content_str)
             return ContentItem(
-                content_type=ContentType.OTHER,
+                content_type=ContentType.FINAL_ANALYSIS,
                 content=result,
                 metadata={
                     "decision_type": decision.decision_type.value,
@@ -271,6 +305,8 @@ class ResearchOrchestrator:
                 token_count=token_count,
                 priority=decision.priority
             )
+        else:
+            raise ValueError(f"Unknown decision type: {decision.decision_type}")
 
     def _should_terminate(self, iteration: ResearchIteration) -> bool:
         logger.debug(

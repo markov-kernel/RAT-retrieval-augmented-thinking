@@ -2,6 +2,12 @@
 Explore agent for managing URL content extraction using Firecrawl.
 Handles webpage scraping, content cleaning, and metadata extraction.
 Supports parallel URL exploration with rate limiting and retries.
+
+Key Features:
+1. Smart URL grouping by domain
+2. Batch scraping for multiple URLs from same domain
+3. Rate limiting and retry logic
+4. Optional structured data extraction
 """
 
 from typing import List, Dict, Any, Optional, Set
@@ -66,6 +72,10 @@ class ExploreAgent(BaseAgent):
         self.retry_delay = self.config.get("retry_delay", 1.0)  # seconds
         self.max_parallel_domains = self.config.get("max_parallel_domains", 3)
         
+        # Batch scraping config
+        self.use_batch_scrape_threshold = self.config.get("use_batch_scrape_threshold", 3)
+        self.max_urls_per_batch = self.config.get("max_urls_per_batch", 10)
+        
         # Domain rate limiting
         self._domain_requests: Dict[str, List[float]] = {}
         self._domain_lock = threading.Lock()
@@ -125,21 +135,41 @@ class ExploreAgent(BaseAgent):
             # Sort URLs by priority within each domain
             urls.sort(key=lambda x: x["priority"], reverse=True)
             
-            # Take top N URLs per domain based on priority
-            for url_info in urls[:self.max_parallel_domains]:
+            # If we have enough URLs for this domain, use batch scraping
+            if len(urls) >= self.use_batch_scrape_threshold:
+                # Take top N URLs for batch processing
+                batch_urls = urls[:self.max_urls_per_batch]
                 decisions.append(
                     ResearchDecision(
                         decision_type=DecisionType.EXPLORE,
-                        priority=url_info["priority"],
+                        priority=max(u["priority"] for u in batch_urls),
                         context={
-                            "url": url_info["url"],
-                            "source_query_id": url_info["query_id"],
-                            "rationale": url_info["rationale"],
-                            "domain": domain
+                            "urls": [u["url"] for u in batch_urls],
+                            "source_query_ids": [u["query_id"] for u in batch_urls],
+                            "rationale": f"Batch scraping {len(batch_urls)} URLs from domain {domain}",
+                            "domain": domain,
+                            "is_batch": True
                         },
-                        rationale=f"Parallel exploration of domain {domain}"
+                        rationale=f"Batch exploration of domain {domain}"
                     )
                 )
+            else:
+                # Otherwise use single-page scraping for each URL
+                for url_info in urls[:self.max_parallel_domains]:
+                    decisions.append(
+                        ResearchDecision(
+                            decision_type=DecisionType.EXPLORE,
+                            priority=url_info["priority"],
+                            context={
+                                "url": url_info["url"],
+                                "source_query_id": url_info["query_id"],
+                                "rationale": url_info["rationale"],
+                                "domain": domain,
+                                "is_batch": False
+                            },
+                            rationale=f"Single-page exploration: {url_info['url']}"
+                        )
+                    )
         
         return decisions
         
@@ -158,67 +188,140 @@ class ExploreAgent(BaseAgent):
     def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
         """
         Execute a URL exploration decision with retries and rate limiting.
+        Supports both single-page and batch scraping.
         """
         start_time = time.time()
         success = False
         results = {}
         
         try:
-            url = decision.context["url"]
             domain = decision.context["domain"]
+            is_batch = decision.context.get("is_batch", False)
             
             # Check domain rate limits
             if not self._check_domain_rate_limit(domain):
                 rprint(f"[yellow]ExploreAgent: Rate limit hit for domain {domain}[/yellow]")
                 time.sleep(1.0)  # Basic backoff
             
-            # Execute with retries
-            for attempt in range(self.max_retries):
-                try:
-                    results = self.firecrawl.extract_content(url)
-                    break
-                except Exception as e:
-                    if attempt < self.max_retries - 1:
-                        rprint(f"[yellow]ExploreAgent: Retry {attempt + 1} for {url}: {e}[/yellow]")
-                        time.sleep(self.retry_delay)
-                    else:
-                        raise
-            
-            # Track exploration with thread safety
-            with self._url_lock:
-                self.explored_urls[url] = ExplorationTarget(
-                    url=url,
-                    priority=decision.priority,
-                    rationale=decision.context["rationale"],
-                    source_query_id=decision.context.get("source_query_id"),
-                    status="completed",
-                    results=results
-                )
-            
-            success = bool(results.get("text"))
-            if success:
-                rprint(f"[green]ExploreAgent: Content extracted from {url}[/green]")
+            if is_batch:
+                # Batch scraping
+                urls = decision.context["urls"]
+                source_query_ids = decision.context.get("source_query_ids", [None] * len(urls))
+                
+                # Execute batch scrape with retries
+                for attempt in range(self.max_retries):
+                    try:
+                        batch_results = self.firecrawl.scrape_urls_batch(urls)
+                        break
+                    except Exception as e:
+                        if attempt < self.max_retries - 1:
+                            rprint(f"[yellow]ExploreAgent: Retry {attempt + 1} for batch: {e}[/yellow]")
+                            time.sleep(self.retry_delay)
+                        else:
+                            raise
+                
+                # Track each URL's results
+                with self._url_lock:
+                    for url, result, query_id in zip(urls, batch_results, source_query_ids):
+                        self.explored_urls[url] = ExplorationTarget(
+                            url=url,
+                            priority=decision.priority,
+                            rationale=decision.context["rationale"],
+                            source_query_id=query_id,
+                            status="completed",
+                            results=result
+                        )
+                
+                # Return combined results
+                results = {
+                    "batch_results": batch_results,
+                    "urls": urls,
+                    "domain": domain
+                }
+                success = True
+                rprint(f"[green]ExploreAgent: Batch-scraped {len(urls)} URLs from {domain}[/green]")
+                
             else:
-                rprint(f"[yellow]ExploreAgent: No content extracted from {url}[/yellow]")
+                # Single-page scraping
+                url = decision.context["url"]
+                
+                # Execute with retries
+                for attempt in range(self.max_retries):
+                    try:
+                        results = self.firecrawl.extract_content(url)
+                        break
+                    except Exception as e:
+                        if attempt < self.max_retries - 1:
+                            rprint(f"[yellow]ExploreAgent: Retry {attempt + 1} for {url}: {e}[/yellow]")
+                            time.sleep(self.retry_delay)
+                        else:
+                            raise
+                
+                # Track exploration
+                with self._url_lock:
+                    self.explored_urls[url] = ExplorationTarget(
+                        url=url,
+                        priority=decision.priority,
+                        rationale=decision.context["rationale"],
+                        source_query_id=decision.context.get("source_query_id"),
+                        status="completed",
+                        results=results
+                    )
+                
+                success = bool(results.get("text"))
+                if success:
+                    rprint(f"[green]ExploreAgent: Content extracted from {url}[/green]")
+                else:
+                    rprint(f"[yellow]ExploreAgent: No content extracted from {url}[/yellow]")
                 
         except Exception as e:
             rprint(f"[red]ExploreAgent error: {str(e)}[/red]")
-            results = {
-                "error": str(e),
-                "text": "",
-                "metadata": {"url": decision.context.get("url", "")}
-            }
             
-            # Log failed exploration
-            with self._url_lock:
-                self.explored_urls[url] = ExplorationTarget(
-                    url=url,
-                    priority=decision.priority,
-                    rationale=decision.context["rationale"],
-                    source_query_id=decision.context.get("source_query_id"),
-                    status="failed",
-                    results=results
-                )
+            if decision.context.get("is_batch"):
+                # For batch failures, create error results for each URL
+                urls = decision.context["urls"]
+                results = {
+                    "batch_results": [
+                        {
+                            "error": str(e),
+                            "text": "",
+                            "metadata": {"url": url}
+                        }
+                        for url in urls
+                    ],
+                    "urls": urls,
+                    "domain": domain
+                }
+                
+                # Mark all URLs as failed
+                with self._url_lock:
+                    for url in urls:
+                        self.explored_urls[url] = ExplorationTarget(
+                            url=url,
+                            priority=decision.priority,
+                            rationale=decision.context["rationale"],
+                            source_query_id=None,
+                            status="failed",
+                            results={"error": str(e), "text": "", "metadata": {"url": url}}
+                        )
+            else:
+                # Single URL failure
+                url = decision.context["url"]
+                results = {
+                    "error": str(e),
+                    "text": "",
+                    "metadata": {"url": url}
+                }
+                
+                with self._url_lock:
+                    self.explored_urls[url] = ExplorationTarget(
+                        url=url,
+                        priority=decision.priority,
+                        rationale=decision.context["rationale"],
+                        source_query_id=decision.context.get("source_query_id"),
+                        status="failed",
+                        results=results
+                    )
             
         finally:
             execution_time = time.time() - start_time
@@ -249,19 +352,21 @@ class ExploreAgent(BaseAgent):
     
     def _is_valid_url(self, url: str) -> bool:
         """
-        Validate a URL for exploration.
+        Validate a URL.
         
         Args:
             url: URL to validate
             
         Returns:
-            True if the URL is valid and allowed
+            True if URL is valid
         """
         try:
+            if not url:
+                return False
+                
+            # Basic URL parsing
             parsed = urlparse(url)
-            
-            # Basic validation
-            if not all([parsed.scheme, parsed.netloc]):
+            if not parsed.netloc:
                 return False
                 
             # Check allowed domains if specified
@@ -269,7 +374,7 @@ class ExploreAgent(BaseAgent):
                 domain = parsed.netloc.lower()
                 if not any(domain.endswith(d.lower()) for d in self.allowed_domains):
                     return False
-                    
+            
             return True
             
         except Exception:

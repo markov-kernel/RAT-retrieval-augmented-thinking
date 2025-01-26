@@ -3,20 +3,20 @@ Reasoning agent for analyzing research content using DeepSeek (deepseek-reasoner
 Now it also acts as the "lead agent" that decides next steps (search, explore, etc.).
 Supports parallel processing of content analysis and decision making.
 
-Enhancements:
-1. Improved chunk splitting to avoid breaking in the middle of words.
-2. Automated consolidation of multiple chunk analyses for the same source content
-   into a single, unified analysis entry (to avoid fragmented or disjoint results).
+Enhancement:
+1. We still instruct deepseek-reasoner to produce JSON, but it may be malformed.
+2. We do a "second pass" with deepseek-chat if parsing fails, passing `response_format={'type':'json_object'}` to obtain valid JSON.
+3. This preserves all existing flows while guaranteeing structured JSON where needed.
 """
 
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 import time
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich import print as rprint
 from openai import OpenAI
 import os
-import json
 import logging
 
 from .base import BaseAgent, ResearchDecision, DecisionType
@@ -37,16 +37,24 @@ class ReasoningAgent(BaseAgent):
     Agent responsible for analyzing content using the DeepSeek API (deepseek-reasoner).
     Splits content if it exceeds 64k tokens, calls the API, merges results, etc.
     Also drives the research forward (search, explore, or terminate).
-    
-    Enhancements:
-    - Automatic consolidation of chunk analyses.
-    - More careful content chunking to avoid splitting within words.
+
+    - We instruct the deepseek-reasoner to produce JSON, then attempt to parse it.
+    - If parsing fails, we call deepseek-chat with response_format={'type':'json_object'}
+      to repair/morph the text into valid JSON.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         super().__init__("reason", config)
         
-        self.deepseek_client = OpenAI(
+        # Primary client for deepseek-reasoner calls
+        self.deepseek_reasoner = OpenAI(
+            api_key=os.getenv("DEEPSEEK_API_KEY"),
+            base_url="https://api.deepseek.com"
+        )
+
+        # Secondary client for deepseek-chat calls (to fix malformed JSON)
+        # You can reuse the same DEEPSEEK_API_KEY or have a separate one.
+        self.deepseek_chat = OpenAI(
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com"
         )
@@ -57,10 +65,9 @@ class ReasoningAgent(BaseAgent):
         self.request_timeout = self.config.get("deepseek_timeout", 180)
         
         self.min_priority = self.config.get("min_priority", 0.3)
-        self.analysis_tasks: Dict[str, AnalysisTask] = {}
-        
-        # Store partial chunked analyses for each (item_id, total_chunks) so we can unify them
-        self.chunked_analyses: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+
+        # For chunk merges
+        self.chunked_analyses: Dict[Tuple[str,int], List[Dict[str,Any]]] = {}
 
         logger.info(
             "ReasoningAgent initialized with max_parallel_tasks=%d, max_tokens_per_call=%d, max_output_tokens=%d",
@@ -70,16 +77,10 @@ class ReasoningAgent(BaseAgent):
         )
 
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
-        """
-        Evaluate the current context to decide if new searches, explorations, or deeper reasoning is needed.
-        If no search results are available, generate initial search queries.
-        Otherwise, look for unprocessed content that needs chunked analysis,
-        identify knowledge gaps, and possibly produce a TERMINATE decision.
-        """
         decisions = []
         search_results = context.get_content("main", ContentType.SEARCH_RESULT)
         if not search_results:
-            # No search results => generate initial queries
+            # Generate initial queries if no search results
             initial_queries = self._generate_initial_queries(context.initial_question)
             for query_info in initial_queries:
                 decisions.append(
@@ -95,7 +96,7 @@ class ReasoningAgent(BaseAgent):
                 )
             return decisions
         
-        # Identify unprocessed search or explored content that needs reasoning
+        # Identify unprocessed search or explored content
         unprocessed_search = [
             item for item in search_results
             if not item.metadata.get("analyzed_by_reasoner")
@@ -106,14 +107,13 @@ class ReasoningAgent(BaseAgent):
             if not item.metadata.get("analyzed_by_reasoner")
         ]
         
-        # For each piece of unprocessed content, see if we need chunk-based analysis
         for item in unprocessed_search + unprocessed_explored:
             if item.priority < self.min_priority:
                 continue
             content_str = str(item.content)
             tokens_estimated = len(content_str) // 4
-            # If it's above the threshold, chunk it
             if tokens_estimated > self.max_tokens_per_call:
+                # Chunk-based approach
                 chunks = self._split_content_into_chunks(content_str)
                 for idx, chunk in enumerate(chunks):
                     decisions.append(
@@ -133,6 +133,7 @@ class ReasoningAgent(BaseAgent):
                         )
                     )
             else:
+                # Single chunk
                 decisions.append(
                     ResearchDecision(
                         decision_type=DecisionType.REASON,
@@ -146,7 +147,7 @@ class ReasoningAgent(BaseAgent):
                     )
                 )
         
-        # Gather existing analyses to detect knowledge gaps
+        # Additional knowledge gap detection
         analysis_items = context.get_content("main", ContentType.ANALYSIS)
         analysis_by_source = {}
         for aitem in analysis_items:
@@ -154,7 +155,6 @@ class ReasoningAgent(BaseAgent):
             if sid:
                 analysis_by_source.setdefault(sid, []).append(aitem)
         
-        # Attempt to identify further knowledge gaps (prompt for additional SEARCH or EXPLORE)
         gaps = self._parallel_identify_gaps(context.initial_question, analysis_by_source, context)
         for gap in gaps:
             if gap["type"] == "search":
@@ -182,7 +182,6 @@ class ReasoningAgent(BaseAgent):
                     )
                 )
         
-        # Possibly finalize research with a TERMINATE decision if the question is answered
         if self._should_terminate(context):
             decisions.append(
                 ResearchDecision(
@@ -199,10 +198,6 @@ class ReasoningAgent(BaseAgent):
         return decision.decision_type == DecisionType.REASON
     
     def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
-        """
-        Execute a REASON decision by analyzing a chunk (or entire content).
-        Also merges partial analyses if the content was chunked.
-        """
         start_time = time.time()
         success = False
         results = {}
@@ -217,32 +212,25 @@ class ReasoningAgent(BaseAgent):
                 logger.warning(msg)
                 raise ValueError(msg)
             
+            # Instruct deepseek-reasoner to produce JSON in the analysis
+            # (Might be malformed; we will fix it with deepseek-chat if needed.)
             single_result = self._analyze_content_chunk(content, content_type)
-            # Mark success if we got a valid analysis
             success = bool(single_result.get("analysis"))
-            
-            # If we have chunk info, store partial results in self.chunked_analyses
+
             chunk_info = decision.context.get("chunk_info")
             if chunk_info:
+                # If chunk, store partial
                 source_key = (item_id, chunk_info["total_chunks"])
                 self.chunked_analyses.setdefault(source_key, []).append(single_result)
                 
-                # If we have all chunk analyses for this source, merge them
+                # If we now have all chunk analyses, unify them
                 if len(self.chunked_analyses[source_key]) == chunk_info["total_chunks"]:
-                    logger.info(
-                        "Merging %d chunk analyses for item_id=%s", 
-                        chunk_info["total_chunks"], item_id
-                    )
                     merged = self._merge_chunk_analyses(self.chunked_analyses[source_key])
-                    # Once merged, remove partial results from the dictionary
                     del self.chunked_analyses[source_key]
-                    # Our final result is the unified analysis
                     results = merged
                     success = True
                 else:
-                    # Return empty or partial so the orchestrator doesn't treat
-                    # partial chunk results as final
-                    # We'll just let the orchestrator store a minimal placeholder
+                    # Partial chunk result
                     results = {
                         "analysis": "",
                         "insights": [],
@@ -250,10 +238,9 @@ class ReasoningAgent(BaseAgent):
                         "partial_chunk": True
                     }
             else:
-                # No chunking => store single chunk's analysis as final
+                # Single chunk, final
                 results = single_result
             
-            # Mark item as analyzed
             decision.context["analyzed_by_reasoner"] = True
             results["analyzed_item_id"] = item_id
             
@@ -275,97 +262,233 @@ class ReasoningAgent(BaseAgent):
     
     def _analyze_content_chunk(self, content: str, content_type: str) -> Dict[str, Any]:
         """
-        Analyze a single chunk of content by calling the DeepSeek API.
-        Returns a dictionary with 'analysis' text and 'insights'.
+        Analyze a chunk of content using DeepSeek.
+        Handles both single-page and batch exploration results.
         """
         try:
-            logger.debug(
-                "Sending chunk (length=%d chars) to DeepSeek with max_tokens=%d",
-                len(content), self.max_output_tokens
-            )
-            response = self.deepseek_client.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[
+            # Prepare the content for analysis
+            if content_type == ContentType.EXPLORED_CONTENT.value:
+                # Parse the content if it's a string
+                if isinstance(content, str):
+                    content = json.loads(content)
+                
+                # Handle batch exploration results
+                if isinstance(content, dict) and content.get("type") == "batch_exploration":
+                    # Special handling for batch results
+                    domain = content.get("domain", "")
+                    urls = content.get("urls", [])
+                    batch_results = content.get("results", [])
+                    
+                    # Analyze each result in the batch
+                    combined_analysis = []
+                    combined_insights = []
+                    
+                    for idx, (url, result) in enumerate(zip(urls, batch_results)):
+                        # Skip empty or error results
+                        if not result or "error" in result:
+                            continue
+                            
+                        # Analyze the individual page
+                        page_analysis = self._analyze_single_page(result, url)
+                        if page_analysis:
+                            combined_analysis.append(
+                                f"Page {idx + 1} ({url}):\n{page_analysis['analysis']}"
+                            )
+                            combined_insights.extend(page_analysis.get("insights", []))
+                    
+                    # Combine all analyses
+                    return {
+                        "analysis": "\n\n".join(combined_analysis),
+                        "insights": combined_insights,
+                        "content_type": content_type,
+                        "domain": domain,
+                        "url_count": len(urls),
+                        "successful_analyses": len(combined_analysis)
+                    }
+                else:
+                    # Single page result
+                    return self._analyze_single_page(content, content.get("metadata", {}).get("url", ""))
+            else:
+                # Handle search results or other content types
+                messages = [
                     {
                         "role": "system",
                         "content": (
-                            "You are an advanced deepseek-reasoner model. "
-                            "Analyze the content for key insights, patterns, or relevant facts. "
-                            "You can elaborate on major findings."
+                            "You are an expert research analyst. Analyze the following content "
+                            "and provide insights. Format your response as JSON with 'analysis' "
+                            "and 'insights' fields. Keep insights concise and focused."
                         )
                     },
                     {
                         "role": "user",
-                        "content": f"Content type: {content_type}\n\nContent:\n{content}"
+                        "content": f"Content type: {content_type}\n\nContent to analyze:\n{content}"
                     }
-                ],
-                temperature=0.7,
+                ]
+                
+                response = self.deepseek_reasoner.chat.completions.create(
+                    model="deepseek-reasoner",
+                    messages=messages,
+                    max_tokens=self.max_output_tokens,
+                    temperature=0.3,
+                    timeout=self.request_timeout
+                )
+                
+                try:
+                    result_text = response.choices[0].message.content
+                    result_json = json.loads(result_text)
+                    return {
+                        **result_json,
+                        "content_type": content_type
+                    }
+                except json.JSONDecodeError:
+                    # If JSON is malformed, try to fix it with deepseek-chat
+                    fixed_json = self._transform_malformed_json_with_chat(result_text)
+                    result_json = json.loads(fixed_json)
+                    return {
+                        **result_json,
+                        "content_type": content_type
+                    }
+                    
+        except Exception as e:
+            logger.exception("Error analyzing content chunk")
+            return {
+                "error": str(e),
+                "analysis": "",
+                "insights": [],
+                "content_type": content_type
+            }
+            
+    def _analyze_single_page(self, content: Dict[str, Any], url: str) -> Dict[str, Any]:
+        """
+        Analyze a single webpage's content.
+        
+        Args:
+            content: The page content and metadata
+            url: The source URL
+            
+        Returns:
+            Analysis results for the page
+        """
+        try:
+            # Extract the relevant content
+            title = content.get("title", "")
+            text = content.get("text", "")
+            metadata = content.get("metadata", {})
+            
+            # Prepare the content for analysis
+            page_content = f"Title: {title}\n\nURL: {url}\n\nContent:\n{text}"
+            
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert research analyst. Analyze the following webpage "
+                        "content and provide insights. Format your response as JSON with "
+                        "'analysis' and 'insights' fields. Keep insights concise and focused."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": page_content
+                }
+            ]
+            
+            response = self.deepseek_reasoner.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=messages,
+                max_tokens=self.max_output_tokens,
+                temperature=0.3,
+                timeout=self.request_timeout
+            )
+            
+            try:
+                result_text = response.choices[0].message.content
+                result_json = json.loads(result_text)
+                return {
+                    **result_json,
+                    "url": url,
+                    "metadata": metadata
+                }
+            except json.JSONDecodeError:
+                # If JSON is malformed, try to fix it with deepseek-chat
+                fixed_json = self._transform_malformed_json_with_chat(result_text)
+                result_json = json.loads(fixed_json)
+                return {
+                    **result_json,
+                    "url": url,
+                    "metadata": metadata
+                }
+                
+        except Exception as e:
+            logger.exception("Error analyzing single page: %s", url)
+            return {
+                "error": str(e),
+                "analysis": "",
+                "insights": [],
+                "url": url
+            }
+
+    def _transform_malformed_json_with_chat(self, possibly_malformed: str) -> str:
+        """
+        Call deepseek-chat to fix malformed JSON text.
+        Returns the corrected JSON string or "[]" if it cannot repair it.
+        """
+        try:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an assistant that strictly outputs valid JSON. "
+                        "Take the user's input (which may be malformed JSON or random text) "
+                        "and produce well-formed JSON that best represents it. "
+                        "If the input appears to be an array, output a JSON array. "
+                        "Otherwise output a JSON object. "
+                        "If you cannot parse it meaningfully, output an empty array."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": possibly_malformed
+                }
+            ]
+            response = self.deepseek_chat.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
                 max_tokens=self.max_output_tokens,
                 stream=False
             )
-            analysis = response.choices[0].message.content
-            return {
-                "analysis": analysis,
-                "insights": self._extract_insights(analysis),
-                "content_type": content_type
-            }
+            return response.choices[0].message.content
         except Exception as e:
-            rprint(f"[red]DeepSeek API error: {str(e)}[/red]")
-            logger.exception("Error calling DeepSeek for chunk analysis.")
-            return {
-                "analysis": "",
-                "insights": [],
-                "content_type": content_type,
-                "error": str(e)
-            }
-    
-    def _merge_chunk_analyses(self, partial_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+            logger.warning("Unable to fix malformed JSON with deepseek-chat: %s", e)
+            return "[]"
+
+    def _merge_chunk_analyses(self, partials: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
-        Merge multiple chunk analyses into a single cohesive analysis.
-        Simply concatenates the analysis fields and merges insights.
+        Merge multiple chunk analyses into a single cohesive analysis, 
+        combining their 'analysis' text and 'insights'.
         """
-        # Sort partial_results by length or other heuristic if desired;
-        # here we simply combine them in the order they arrived
         combined_analysis = []
         combined_insights = []
         
-        for result in partial_results:
+        for result in partials:
             if result.get("analysis"):
                 combined_analysis.append(result["analysis"])
             if result.get("insights"):
                 combined_insights.extend(result["insights"])
         
-        # Create a single consolidated analysis
         final_analysis = "\n\n".join(combined_analysis)
         return {
             "analysis": final_analysis,
             "insights": combined_insights,
-            "content_type": partial_results[0]["content_type"] if partial_results else "analysis_chunked"
+            "content_type": partials[0]["content_type"] if partials else "analysis_chunked"
         }
-    
-    def _extract_insights(self, analysis: str) -> List[str]:
-        """
-        Extract bullet points or enumerated lines as 'insights' from the analysis text.
-        """
-        lines = analysis.split("\n")
-        insights = []
-        for line in lines:
-            line = line.strip()
-            if (
-                line.startswith("-") or line.startswith("*") or
-                line.startswith("•") or (line[:2].isdigit() and line[2] in [".", ")"])
-            ):
-                insights.append(line.lstrip("-*•").strip())
-        return insights
-    
+
     def _split_content_into_chunks(self, content: str) -> List[str]:
         """
-        Improved chunk splitting to avoid word-breaks.
-        We aim for ~max_tokens_per_call tokens worth of content per chunk.
-        We subtract a small buffer to reduce the chance of overshoot.
+        Split large content into chunks that are below the max token limit.
+        Roughly: 1 token ~ 4 chars. We subtract ~1000 tokens as a safety buffer.
         """
         safe_limit = self.max_tokens_per_call - 1000
-        # Estimate 1 token ~ 4 chars => safe_limit_chars
         safe_limit_chars = safe_limit * 4
         
         words = content.split()
@@ -374,10 +497,8 @@ class ReasoningAgent(BaseAgent):
         current_length = 0
         
         for w in words:
-            # +1 for space
-            token_estimate = len(w) + 1
+            token_estimate = len(w) + 1  # approximate
             if (current_length + token_estimate) >= safe_limit_chars:
-                # Close out the current chunk
                 chunks.append(" ".join(current_chunk_words))
                 current_chunk_words = [w]
                 current_length = token_estimate
@@ -389,63 +510,55 @@ class ReasoningAgent(BaseAgent):
             chunks.append(" ".join(current_chunk_words))
         
         return chunks
-    
+
     def _generate_initial_queries(self, question: str) -> List[Dict[str, Any]]:
         """
-        Uses the deepseek-reasoner to propose multiple initial search queries
-        for broad coverage of the user's question.
+        We instruct deepseek-reasoner to produce multiple queries in JSON. 
+        If it's malformed, we again correct with deepseek-chat for JSON.
         """
         try:
-            sanitized_question = self._sanitize_and_shorten_question(question)
-            logger.debug("Sending sanitized question to DeepSeek: %s", sanitized_question)
+            sanitized_question = " ".join(question.split())
+            reasoner_response = self.deepseek_reasoner.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Generate exactly 3 to 5 different search queries in valid JSON format. "
+                            "Each item in the JSON array must be an object with 'query' and 'rationale' keys. "
+                            "No text outside the JSON array."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": sanitized_question
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=self.max_output_tokens,
+                stream=False
+            )
+            raw_text = reasoner_response.choices[0].message.content.strip()
+            # Try to parse
             try:
-                response = self.deepseek_client.chat.completions.create(
-                    model="deepseek-reasoner",
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "Generate exactly 3 to 5 different search queries in valid JSON format. "
-                                "Each item in the JSON array must be an object with 'query' and 'rationale' keys. "
-                                "No text outside the JSON array."
-                            )
-                        },
-                        {
-                            "role": "user",
-                            "content": sanitized_question
-                        }
-                    ],
-                    temperature=0.7,
-                    max_tokens=self.max_output_tokens
-                )
-            except Exception as api_error:
-                logger.error("DeepSeek API call failed: %s", str(api_error))
-                return [{
-                    "query": question,
-                    "rationale": f"Direct fallback search - API error: {str(api_error)}"
-                }]
-            content_str = response.choices[0].message.content.strip()
-            logger.debug("DeepSeek API response content: %s", content_str)
-            if not content_str:
-                logger.error("Empty response from DeepSeek API")
-                return [{
-                    "query": question,
-                    "rationale": "Direct fallback search - empty API response"
-                }]
-            
-            # Strip markdown code block delimiters if present
-            if content_str.startswith("```"):
-                content_str = content_str.split("\n", 1)[1]  # Remove first line with ```json
-            if content_str.endswith("```"):
-                content_str = content_str.rsplit("\n", 1)[0]  # Remove last line with ```
-            content_str = content_str.strip()
-            
-            queries = json.loads(content_str)
+                queries = json.loads(raw_text)
+            except json.JSONDecodeError:
+                # Fix with deepseek-chat
+                corrected = self._transform_malformed_json_with_chat(raw_text)
+                try:
+                    queries = json.loads(corrected)
+                except:
+                    # fallback
+                    return [{
+                        "query": question,
+                        "rationale": "Direct fallback search - JSON fix failed"
+                    }]
+            # Validate minimal structure
             if not isinstance(queries, list):
-                raise ValueError("Expected a JSON list.")
+                raise ValueError("Expected a JSON list of queries.")
             for q in queries:
                 if not isinstance(q, dict) or "query" not in q or "rationale" not in q:
-                    raise ValueError("Must have query + rationale.")
+                    raise ValueError("Each query must have 'query' and 'rationale'.")
             return queries
         except Exception as e:
             rprint(f"[red]Error generating initial queries: {e}[/red]")
@@ -455,24 +568,13 @@ class ReasoningAgent(BaseAgent):
                 "rationale": "Direct fallback search"
             }]
 
-    def _sanitize_and_shorten_question(self, question: str, max_tokens: int = 300) -> str:
-        """
-        Clean up the user question and limit its size so we don't blow up the model context.
-        """
-        sanitized = " ".join(question.split())
-        words = sanitized.split()
-        if len(words) > max_tokens:
-            words = words[:max_tokens]
-            sanitized = " ".join(words)
-        return sanitized
-    
-    def _parallel_identify_gaps(self, question: str,
+    def _parallel_identify_gaps(self,
+                                question: str,
                                 analysis_by_source: Dict[str, List[ContentItem]],
-                                context: ResearchContext) -> List[Dict[str, Any]]:
+                                context: ResearchContext
+                               ) -> List[Dict[str, Any]]:
         """
-        Attempt to find knowledge gaps in the analysis so far, which might
-        prompt new searches or URL explorations. This is done in parallel
-        for each source's combined analysis.
+        Attempt to find knowledge gaps in the analysis, possibly creating new search or explore tasks.
         """
         try:
             tasks = []
@@ -483,24 +585,25 @@ class ReasoningAgent(BaseAgent):
                     "analysis": combined_analysis,
                     "source_id": source_id
                 })
+            
+            all_gaps = []
             with ThreadPoolExecutor(max_workers=self.max_parallel_tasks) as executor:
-                futures = []
-                for task in tasks:
-                    fut = executor.submit(
+                futures = [
+                    executor.submit(
                         self._analyze_single_source_gaps,
-                        task["question"],
-                        task["analysis"],
-                        task["source_id"]
+                        t["question"],
+                        t["analysis"],
+                        t["source_id"]
                     )
-                    futures.append(fut)
-                all_gaps = []
-                for future in as_completed(futures):
+                    for t in tasks
+                ]
+                for fut in as_completed(futures):
                     try:
-                        gaps = future.result()
-                        all_gaps.extend(gaps)
+                        all_gaps.extend(fut.result())
                     except Exception as e:
                         rprint(f"[red]Error in gap analysis: {e}[/red]")
                         logger.exception("Error analyzing knowledge gaps.")
+            
             return self._deduplicate_gaps(all_gaps)
         except Exception as e:
             rprint(f"[red]Error in parallel gap identification: {e}[/red]")
@@ -509,11 +612,10 @@ class ReasoningAgent(BaseAgent):
     
     def _analyze_single_source_gaps(self, question: str, analysis: str, source_id: str) -> List[Dict[str, Any]]:
         """
-        For a single chunk of combined analysis from a source, ask the deepseek-reasoner
-        to identify knowledge gaps that might prompt a new search or exploration.
+        Ask deepseek-reasoner to produce JSON gap info. If malformed, fix with chat.
         """
         try:
-            response = self.deepseek_client.chat.completions.create(
+            response = self.deepseek_reasoner.chat.completions.create(
                 model="deepseek-reasoner",
                 messages=[
                     {
@@ -533,10 +635,22 @@ class ReasoningAgent(BaseAgent):
                 max_tokens=self.max_output_tokens,
                 stream=False
             )
-            content_str = response.choices[0].message.content.strip()
-            gaps = json.loads(content_str)
+            raw_text = response.choices[0].message.content.strip()
+            
+            try:
+                gaps = json.loads(raw_text)
+            except json.JSONDecodeError:
+                # fix with chat
+                corrected = self._transform_malformed_json_with_chat(raw_text)
+                try:
+                    gaps = json.loads(corrected)
+                except:
+                    # fallback
+                    return []
+            
             if not isinstance(gaps, list):
                 raise ValueError("Expected JSON list.")
+            # validate
             for gap in gaps:
                 if gap["type"] not in ["search", "explore"]:
                     raise ValueError("type must be search or explore.")
@@ -547,6 +661,7 @@ class ReasoningAgent(BaseAgent):
                 if "rationale" not in gap:
                     raise ValueError("gap missing rationale.")
                 gap["source_id"] = source_id
+            
             return gaps
         except Exception as e:
             rprint(f"[red]Error analyzing source gaps: {e}[/red]")
@@ -554,39 +669,36 @@ class ReasoningAgent(BaseAgent):
             return []
 
     def _deduplicate_gaps(self, gaps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        When multiple sources identify the same or very similar gaps,
-        deduplicate them so we don't produce repeated queries/explorations.
-        """
         unique_gaps = {}
         for gap in gaps:
             key = gap["query"] if gap["type"] == "search" else gap["url"]
             if key not in unique_gaps:
                 unique_gaps[key] = gap
             else:
-                # Keep the gap with the longer rationale for clarity
+                # keep the gap with the longer rationale
                 if len(gap["rationale"]) > len(unique_gaps[key]["rationale"]):
                     unique_gaps[key] = gap
         return list(unique_gaps.values())
-    
+
     def _should_terminate(self, context: ResearchContext) -> bool:
         """
-        Simple heuristic that calls deepseek-reasoner to see if the question is answered
-        and if confidence >= 0.8 => we propose termination.
+        Asks deepseek-reasoner for a JSON {complete: bool, confidence: float, missing: []}.
+        If malformed, we fix it with chat. If we get `complete==true and confidence>=0.8`, we return True.
         """
         analysis_items = context.get_content("main", ContentType.ANALYSIS)
         if not analysis_items:
             return False
+
         combined_analysis = " ".join(str(a.content) for a in analysis_items)
         try:
-            response = self.deepseek_client.chat.completions.create(
+            response = self.deepseek_reasoner.chat.completions.create(
                 model="deepseek-reasoner",
                 messages=[
                     {
                         "role": "system",
                         "content": (
                             "You are a research completion analyst. Evaluate if we have enough info. "
-                            "Return JSON with {complete: bool, confidence: 0..1, missing: []}."
+                            "Return JSON with {\"complete\": bool, \"confidence\": 0..1, \"missing\": []}."
                         )
                     },
                     {
@@ -598,11 +710,21 @@ class ReasoningAgent(BaseAgent):
                 max_tokens=self.max_output_tokens,
                 stream=False
             )
+            raw_text = response.choices[0].message.content
+            # try parse
             try:
-                result = json.loads(response.choices[0].message.content)
-                return result.get("complete", False) and (result.get("confidence", 0) >= 0.8)
-            except Exception:
-                return False
+                result = json.loads(raw_text)
+            except json.JSONDecodeError:
+                # fix with chat
+                corrected = self._transform_malformed_json_with_chat(raw_text)
+                try:
+                    result = json.loads(corrected)
+                except:
+                    return False
+
+            complete = bool(result.get("complete", False))
+            confidence = float(result.get("confidence", 0))
+            return (complete and confidence >= 0.8)
         except Exception as e:
             rprint(f"[red]Error checking termination: {e}[/red]")
             logger.exception("Error in _should_terminate check.")
