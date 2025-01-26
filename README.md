@@ -29,8 +29,8 @@ This approach ensures more thoughtful, contextually aware, and reliable response
 • Python 3.11 or higher  
 • A .env file containing:
   ```plaintext
-  DEEPSEEK_API_KEY=your_deepseek_api_key_here
-  OPENROUTER_API_KEY=your_openrouter_api_key_here
+  DEEPSEEK_API_KEY=your_deepseek_api_key
+  OPENROUTER_API_KEY=your_openrouter_api_key
   optional
   ANTHROPIC_API_KEY=your_anthropic_api_key_here
   ```
@@ -56,8 +56,8 @@ This will install RAT as a command-line tool, allowing you to run it from anywhe
 
 1. Ensure your .env file is configured with:
    ```plaintext
-   DEEPSEEK_API_KEY=your_deepseek_api_key_here
-   OPENROUTER_API_KEY=your_openrouter_api_key_here
+   DEEPSEEK_API_KEY=your_deepseek_api_key
+   OPENROUTER_API_KEY=your_openrouter_api_key
    optional
    ANTHROPIC_API_KEY=your_anthropic_api_key_here 
    ```
@@ -117,4 +117,110 @@ GitHub: https://github.com/yourusername/rat
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=Doriandarko/RAT-retrieval-augmented-thinking&type=Date)](https://star-history.com/#Doriandarko/RAT-retrieval-augmented-thinking&Date)
+
+# RAT Research - Enhanced Retrieval Augmented Thinking
+
+RAT Research is an enhanced version of the Retrieval Augmented Thinking (RAT) system that combines DeepSeek's reasoning capabilities with web research through Perplexity API and Jina Reader. It generates comprehensive research papers in response to your questions.
+
+## Features
+
+- **DeepSeek Reasoning**: Analyzes research questions and plans the research approach
+- **Perplexity Web Search**: Conducts intelligent web searches to gather information
+- **Jina Reader Integration**: Extracts and processes content from web sources
+- **Dynamic Paper Generation**: Creates well-structured research papers in markdown format
+- **Multiple Output Formats**: Supports both corporate and academic paper styles
+- **Citation Management**: Tracks and formats source citations
+- **Interactive CLI**: User-friendly command-line interface with rich formatting
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/RAT-research.git
+cd RAT-research
+```
+
+2. Install dependencies:
+```bash
+pip install -e .
+```
+
+3. Set up environment variables in `.env`:
+```
+DEEPSEEK_API_KEY=your_deepseek_api_key
+PERPLEXITY_API_KEY=your_perplexity_api_key
+JINA_API_KEY=your_jina_api_key
+```
+
+## Usage
+
+Start the RAT Research CLI:
+```bash
+python -m rat.rat_research
+```
+
+### Commands
+
+- Type your research question to start the research process
+- `reasoning` - Toggle visibility of the reasoning process
+- `export` - Export the last generated paper to a file
+- `clear` - Clear research history
+- `quit` - Exit the application
+
+### Example
+
+```
+Research Question: What are the latest developments in quantum computing?
+
+[Research Approach Reasoning]
+1. First, we'll search for recent academic and industry sources...
+2. Then, we'll analyze quantum computing breakthroughs...
+3. Finally, we'll synthesize the findings into a comprehensive report...
+
+[Conducting Research...]
+...
+
+[Generated Paper]
+# Latest Developments in Quantum Computing
+
+## Executive Summary
+...
+```
+
+## Paper Formats
+
+### Corporate Format
+- Executive Summary
+- Key Findings
+- Detailed Analysis
+- Recommendations
+- Sources
+
+### Academic Format
+- Abstract
+- Introduction
+- Methodology
+- Results
+- Discussion
+- Conclusion
+- References
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- Built upon the original RAT system
+- Uses DeepSeek for reasoning capabilities
+- Integrates Perplexity API for web search
+- Uses Jina Reader for content extraction
 

@@ -12,7 +12,7 @@ import time  # Add time import
 # Model Constants
 DEEPSEEK_MODEL = "deepseek-reasoner"
 OPENROUTER_MODEL = "openai/gpt-4o-mini"
-
+ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022"
 # Load environment variables
 load_dotenv()
 
