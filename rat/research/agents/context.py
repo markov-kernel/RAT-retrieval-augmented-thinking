@@ -16,9 +16,7 @@ class ContentType(Enum):
     SEARCH_RESULT = "search_result"
     URL_CONTENT = "url_content"
     ANALYSIS = "analysis"
-    CODE_OUTPUT = "code_output"
     EXPLORED_CONTENT = "explored_content"
-    STRUCTURED_OUTPUT = "structured_output"
     OTHER = "other"
 
 @dataclass
@@ -71,7 +69,9 @@ class ResearchContext:
     through branching and merging operations.
     """
     
-    MAX_TOKENS_PER_BRANCH = 64000  # deepseek-reasoner limit
+    # Increased limit to match large Gemini input allowance.
+    # We'll chunk if needed, up to 1,048,576 tokens total
+    MAX_TOKENS_PER_BRANCH = 1048576
     
     def __init__(self, initial_question: str):
         """

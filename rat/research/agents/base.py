@@ -1,20 +1,23 @@
 """
 Base agent interface and core decision-making structures.
 Defines the contract that all specialized research agents must implement.
+Includes support for parallel processing and concurrency control.
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from enum import Enum
 from rich import print as rprint
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 
 class DecisionType(Enum):
     """Types of decisions an agent can make during research."""
     SEARCH = "search"      # New search query needed
     EXPLORE = "explore"    # URL exploration needed
-    REASON = "reason"      # Deep analysis needed (deepseek-reasoner)
-    EXECUTE = "execute"    # Code or structured output needed
+    REASON = "reason"      # Deep analysis needed (using Gemini now)
     TERMINATE = "terminate"# Research complete or no further steps
 
 @dataclass
@@ -41,8 +44,9 @@ class BaseAgent(ABC):
     """
     Base class for all research agents.
     
-    Each specialized agent (search, explore, reason, execute) must implement
+    Each specialized agent (search, explore, reason) must implement
     the analyze method to make decisions based on the current research context.
+    Supports parallel execution of decisions with concurrency control.
     """
     
     def __init__(self, name: str, config: Optional[Dict[str, Any]] = None):
@@ -60,8 +64,22 @@ class BaseAgent(ABC):
             "decisions_made": 0,
             "successful_executions": 0,
             "failed_executions": 0,
-            "total_execution_time": 0.0
+            "total_execution_time": 0.0,
+            "parallel_executions": 0,
+            "max_concurrent_tasks": 0,
+            "rate_limit_delays": 0,
+            "retry_attempts": 0
         }
+        
+        # Concurrency controls
+        self.max_workers = self.config.get("max_workers", 5)
+        # Rate limit: requests per minute
+        self.rate_limit = self.config.get("rate_limit", 100)
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        self._active_tasks: Set[str] = set()
+        self._tasks_lock = threading.Lock()
+        self._last_request_time = 0
+        self._rate_limit_lock = threading.Lock()
     
     @abstractmethod
     def analyze(self, context: 'ResearchContext') -> List[ResearchDecision]:

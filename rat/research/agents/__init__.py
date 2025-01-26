@@ -1,6 +1,6 @@
 """
 Multi-agent system for research orchestration.
-Provides specialized agents for search, exploration, reasoning, and code execution.
+Provides specialized agents for search, exploration, and reasoning.
 """
 
 from .base import BaseAgent, ResearchDecision, DecisionType
@@ -8,7 +8,6 @@ from .context import ResearchContext, ContextBranch, ContentType
 from .search import SearchAgent
 from .explore import ExploreAgent
 from .reason import ReasoningAgent
-from .execute import ExecutionAgent
 
 __all__ = [
     'BaseAgent',
@@ -19,6 +18,5 @@ __all__ = [
     'ContentType',
     'SearchAgent',
     'ExploreAgent',
-    'ReasoningAgent',
-    'ExecutionAgent'
+    'ReasoningAgent'
 ]

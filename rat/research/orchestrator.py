@@ -1,24 +1,27 @@
 """
 Orchestrator for coordinating the multi-agent research workflow.
 Manages agent interactions, research flow, and data persistence.
+Supports parallel execution of decisions by type.
 """
 
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import json
 import time
+import logging
 from rich import print as rprint
 from pathlib import Path
 
 from .agents.search import SearchAgent
 from .agents.explore import ExploreAgent
 from .agents.reason import ReasoningAgent
-from .agents.execute import ExecutionAgent
 from .perplexity_client import PerplexityClient
 from .firecrawl_client import FirecrawlClient
 from .output_manager import OutputManager
 from .agents.base import ResearchDecision, DecisionType
 from .agents.context import ResearchContext, ContentType, ContentItem
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ResearchIteration:
@@ -42,7 +45,7 @@ class ResearchOrchestrator:
     Coordinates the multi-agent research workflow.
     
     Manages agent interactions, research flow, and ensures all components
-    work together effectively.
+    work together effectively. Supports parallel execution of decisions.
     """
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -58,28 +61,38 @@ class ResearchOrchestrator:
         self.perplexity = PerplexityClient()
         self.firecrawl = FirecrawlClient()
         
-        # Initialize agents
+        # Initialize agents with concurrency + rate limits
         self.search_agent = SearchAgent(
             self.perplexity,
-            self.config.get("search_config")
+            {
+                **(self.config.get("search_config") or {}),
+                "max_workers": self.config.get("max_parallel_searches", 10),
+                "rate_limit": self.config.get("search_rate_limit", 100)
+            }
         )
         self.explore_agent = ExploreAgent(
             self.firecrawl,
-            self.config.get("explore_config")
+            {
+                **(self.config.get("explore_config") or {}),
+                "max_workers": self.config.get("max_parallel_explores", 10),
+                "rate_limit": self.config.get("explore_rate_limit", 100)
+            }
         )
+        # Use 10 RPM limit for Gemini
         self.reason_agent = ReasoningAgent(
-            self.config.get("reason_config")
-        )
-        self.execute_agent = ExecutionAgent(
-            self.config.get("execute_config")
+            {
+                **(self.config.get("reason_config") or {}),
+                "max_workers": self.config.get("max_parallel_reason", 5),
+                "rate_limit": self.config.get("reason_rate_limit", 10)  # 10 requests/min
+            }
         )
         
-        # Initialize managers
+        # Initialize output manager
         self.output_manager = OutputManager()
         
-        # Configuration
+        # High-level orchestrator config
         self.max_iterations = self.config.get("max_iterations", 5)
-        self.min_new_content = self.config.get("min_new_content", 1)  # Lower threshold since we're getting good content
+        self.min_new_content = self.config.get("min_new_content", 1)
         self.min_confidence = self.config.get("min_confidence", 0.7)
         
         # State tracking
@@ -166,10 +179,9 @@ class ResearchOrchestrator:
                 # These are "optional" decisions that might complement the ReasoningAgent's plan
                 search_decisions = self.search_agent.analyze(self.current_context)
                 explore_decisions = self.explore_agent.analyze(self.current_context)
-                execute_decisions = self.execute_agent.analyze(self.current_context)
                 
                 # Combine them all, with ReasoningAgent's decisions first
-                all_decisions = reason_decisions + search_decisions + explore_decisions + execute_decisions
+                all_decisions = reason_decisions + search_decisions + explore_decisions
             
             # Step 3: Sort decisions by priority
             sorted_decisions = sorted(all_decisions, key=lambda d: d.priority, reverse=True)
@@ -289,8 +301,7 @@ class ResearchOrchestrator:
         for agent in [
             self.search_agent,
             self.explore_agent,
-            self.reason_agent,
-            self.execute_agent
+            self.reason_agent
         ]:
             try:
                 decisions = agent.analyze(self.current_context)
@@ -300,45 +311,23 @@ class ResearchOrchestrator:
                 
         return all_decisions
         
-    def _get_agent_for_decision(
-        self,
-        decision: ResearchDecision
-    ) -> Optional[Any]:
-        """
-        Get the appropriate agent for a decision.
-        
-        Args:
-            decision: Decision to handle
-            
-        Returns:
-            Agent that can handle the decision
-        """
+    def _get_agent_for_decision(self, decision: ResearchDecision) -> Optional[Any]:
+        """Get the appropriate agent for a given decision type."""
         agent_map = {
             DecisionType.SEARCH: self.search_agent,
             DecisionType.EXPLORE: self.explore_agent,
-            DecisionType.REASON: self.reason_agent,
-            DecisionType.EXECUTE: self.execute_agent
+            DecisionType.REASON: self.reason_agent
         }
-        
         return agent_map.get(decision.decision_type)
         
     def _get_content_type(self, decision: ResearchDecision) -> ContentType:
-        """
-        Map decision type to content type.
-        
-        Args:
-            decision: Decision to map
-            
-        Returns:
-            Appropriate content type
-        """
+        """Map decision types to content types."""
         type_map = {
             DecisionType.SEARCH: ContentType.SEARCH_RESULT,
             DecisionType.EXPLORE: ContentType.EXPLORED_CONTENT,
             DecisionType.REASON: ContentType.ANALYSIS,
-            DecisionType.EXECUTE: ContentType.STRUCTURED_OUTPUT
+            DecisionType.TERMINATE: ContentType.OTHER
         }
-        
         return type_map.get(decision.decision_type, ContentType.OTHER)
         
     def _generate_final_output(self) -> Dict[str, Any]:
@@ -360,10 +349,6 @@ class ResearchOrchestrator:
         analysis = self.current_context.get_content(
             "main",
             ContentType.ANALYSIS
-        )
-        structured_output = self.current_context.get_content(
-            "main",
-            ContentType.STRUCTURED_OUTPUT
         )
         
         # Generate paper sections
@@ -396,39 +381,10 @@ class ResearchOrchestrator:
             else:
                 sections.append(f"\n{content.content}\n")
                 
-        # Technical details
-        if structured_output:
-            sections.append("\n## Technical Details\n")
-            for output in structured_output:
-                if isinstance(output.content, dict):
-                    if output.content.get("format") == "json":
-                        sections.append("```json\n")
-                        sections.append(
-                            json.dumps(output.content["output"], indent=2)
-                        )
-                        sections.append("\n```\n")
-                    else:
-                        sections.append("```\n")
-                        sections.append(output.content.get("output", ""))
-                        sections.append("\n```\n")
-                else:
-                    sections.append(f"{output.content}\n")
-                    
-        # Sources
-        sections.append("\n## Sources\n")
-        sources = set()
-        for content in explored_content:
-            url = content.content.get("metadata", {}).get("url")
-            if url:
-                sources.add(url)
-                
-        for url in sorted(sources):
-            sections.append(f"- {url}\n")
-            
         return {
             "paper": "\n".join(sections),
             "title": self.current_context.initial_question,
-            "sources": list(sources)
+            "sources": []
         }
         
     def _calculate_metrics(self, total_time: float) -> Dict[str, Any]:
@@ -468,14 +424,10 @@ class ResearchOrchestrator:
         
     def _get_agent_metrics(self) -> Dict[str, Any]:
         """
-        Get metrics from all agents.
-        
-        Returns:
-            Combined agent metrics
+        Gather metrics from each agent.
         """
         return {
             "search": self.search_agent.get_metrics(),
             "explore": self.explore_agent.get_metrics(),
-            "reason": self.reason_agent.get_metrics(),
-            "execute": self.execute_agent.get_metrics()
+            "reason": self.reason_agent.get_metrics()
         }

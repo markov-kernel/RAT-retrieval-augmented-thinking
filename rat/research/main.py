@@ -32,25 +32,25 @@ def load_config() -> Dict[str, Any]:
         'search_config': {
             'max_results': int(os.getenv('MAX_SEARCH_RESULTS', '10')),
             'min_relevance': float(os.getenv('MIN_SEARCH_RELEVANCE', '0.6')),
-            'api_key': os.getenv('PERPLEXITY_API_KEY')
+            'api_key': os.getenv('PERPLEXITY_API_KEY'),
+            'max_workers': int(os.getenv('MAX_PARALLEL_SEARCHES', '10')),
+            'rate_limit': int(os.getenv('SEARCH_RATE_LIMIT', '100'))
         },
         'explore_config': {
             'max_urls': int(os.getenv('MAX_URLS', '20')),
             'min_priority': float(os.getenv('MIN_URL_PRIORITY', '0.5')),
             'allowed_domains': json.loads(os.getenv('ALLOWED_DOMAINS', '[]')),
-            'api_key': os.getenv('FIRECRAWL_API_KEY')
+            'api_key': os.getenv('FIRECRAWL_API_KEY'),
+            'max_workers': int(os.getenv('MAX_PARALLEL_EXPLORES', '10')),
+            'rate_limit': int(os.getenv('EXPLORE_RATE_LIMIT', '100'))
         },
         'reason_config': {
             'max_chunk_size': int(os.getenv('MAX_CHUNK_SIZE', '4000')),
             'min_confidence': float(os.getenv('MIN_ANALYSIS_CONFIDENCE', '0.7')),
-            'parallel_threads': int(os.getenv('PARALLEL_ANALYSIS_THREADS', '4')),
-            'api_key': os.getenv('DEEPSEEK_API_KEY')
-        },
-        'execute_config': {
-            'max_code_length': int(os.getenv('MAX_CODE_LENGTH', '1000')),
-            'max_retries': int(os.getenv('MAX_RETRIES', '3')),
-            'timeout': int(os.getenv('TIMEOUT_SECONDS', '30')),
-            'api_key': os.getenv('CLAUDE_API_KEY')
+            'max_workers': int(os.getenv('MAX_PARALLEL_REASON', '5')),
+            'rate_limit': int(os.getenv('REASON_RATE_LIMIT', '10')),  # 10 RPM for Gemini
+            'api_key': os.getenv('GEMINI_API_KEY'),
+            'gemini_timeout': int(os.getenv('GEMINI_TIMEOUT', '180'))
         }
     }
     return config
@@ -64,8 +64,7 @@ Welcome to the multi-agent research system! This tool helps you conduct comprehe
 
 1. Search Agent (Perplexity) - Intelligent web searching
 2. Explore Agent (Firecrawl) - URL content extraction
-3. Reasoning Agent (DeepSeek) - Content analysis
-4. Execution Agent (Claude) - Code generation and structured output
+3. Reasoning Agent (Gemini) - Content analysis using Gemini 2.0 Flash Thinking
 
 Enter your research question below, or type 'help' for more information.
 """

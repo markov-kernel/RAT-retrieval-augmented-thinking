@@ -1,6 +1,7 @@
 """
-Reasoning agent for analyzing research content using DeepSeek (deepseek-reasoner).
+Reasoning agent for analyzing research content using the Gemini 2.0 Flash Thinking model.
 Now it also acts as the "lead agent" that decides next steps (search, explore, etc.).
+Supports parallel processing of content analysis and decision making.
 """
 
 from typing import List, Dict, Any, Optional
@@ -8,11 +9,16 @@ from dataclasses import dataclass
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich import print as rprint
-from openai import OpenAI
 import os
+import json
+import logging
+
+import google.generativeai as genai
 
 from .base import BaseAgent, ResearchDecision, DecisionType
 from .context import ResearchContext, ContentType, ContentItem
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class AnalysisTask:
@@ -33,33 +39,43 @@ class AnalysisTask:
 
 class ReasoningAgent(BaseAgent):
     """
-    Agent responsible for analyzing content using the DeepSeek API (deepseek-reasoner).
+    Agent responsible for analyzing content using the Gemini 2.0 Flash Thinking model
+    and for driving the overall research flow.
     
-    - Splits content into chunks if exceeding 64k tokens
-    - Runs parallel analysis with multiple deepseek calls
-    - Merges results and can produce further decisions (SEARCH, EXPLORE) if needed
+    - Splits content into chunks if exceeding the input token limit (1,048,576).
+    - Runs parallel analysis with multiple calls to Gemini if needed.
+    - Merges results and can produce further decisions (SEARCH, EXPLORE) if needed.
+    - Potentially decides when to TERMINATE.
     """
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the reasoning agent.
-        
-        Args:
-            config: Optional configuration parameters
-        """
+    def __init__(self, config=None):
         super().__init__("reason", config)
-        
-        # Initialize DeepSeek client
-        self.deepseek_client = OpenAI(
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url="https://api.deepseek.com"
-        )
-        
-        # Configuration
-        self.max_parallel_tasks = self.config.get("max_parallel_tasks", 3)
-        # We enforce the official 64k limit for deepseek reasoning calls
-        self.max_tokens_per_call = 64000
+
+        # Configure the Gemini client
+        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+
+        # We'll store these generation settings to pass each call
+        self.generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 64,
+            "max_output_tokens": 65536,       # Up to 65k tokens out
+            "response_mime_type": "text/plain"
+        }
+        self.model_name = "gemini-2.0-flash-thinking-exp-01-21"
+
+        # We'll chunk input up to a 1,048,576 token estimate
+        self.max_tokens_per_call = 1048576  
+        self.max_output_tokens = 65536
+        self.request_timeout = self.config.get("gemini_timeout", 180)
+
+        # For concurrency chunk splitting
+        self.chunk_margin = 5000   # Safety margin
+
+        # Priority thresholds
         self.min_priority = self.config.get("min_priority", 0.3)
+
+        logger.info("ReasoningAgent initialized to use Gemini model: %s", self.model_name)
         
         # Tracking
         self.analysis_tasks: Dict[str, AnalysisTask] = {}
@@ -185,7 +201,7 @@ class ReasoningAgent(BaseAgent):
         
     def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
         """
-        Execute a reasoning decision using deepseek-reasoner.
+        Execute a reasoning decision using Gemini.
         Potentially split content into multiple chunks and run them in parallel, then merge.
         """
         start_time = time.time()
@@ -238,7 +254,7 @@ class ReasoningAgent(BaseAgent):
         
     def _parallel_analyze_content(self, content: str, content_type: str) -> List[Dict[str, Any]]:
         """
-        Splits large text into ~64k token chunks, then spawns parallel requests to deepseek-reasoner.
+        Splits large text into ~64k token chunks, then spawns parallel requests to Gemini.
         """
         words = content.split()
         chunk_size_words = self.max_tokens_per_call * 4  # approximate word limit
@@ -269,57 +285,43 @@ class ReasoningAgent(BaseAgent):
         
     def _analyze_content_chunk(self, content: str, content_type: str) -> Dict[str, Any]:
         """
-        Calls deepseek to analyze a single chunk of content.
+        Calls Gemini with a single-turn prompt to analyze the content.
         """
-        try:
-            response = self.deepseek_client.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an advanced deepseek-reasoner model. "
-                            "Analyze the content for key insights, patterns, or relevant facts. "
-                            "You can elaborate on major findings."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Content type: {content_type}\n\nContent:\n{content}"
-                    }
-                ],
-                temperature=0.7
-            )
-            analysis = response.choices[0].message.content
-            
-            return {
-                "analysis": analysis,
-                "insights": self._extract_insights(analysis),
-                "content_type": content_type
-            }
-        except Exception as e:
-            rprint(f"[red]DeepSeek API error: {str(e)}[/red]")
-            return {
-                "analysis": "",
-                "insights": [],
-                "content_type": content_type,
-                "error": str(e)
-            }
-            
-    def _extract_insights(self, analysis: str) -> List[str]:
+        # Create a chat session
+        model = genai.GenerativeModel(
+            model_name=self.model_name,
+            generation_config=self.generation_config
+        )
+        chat_session = model.start_chat(history=[])
+
+        # We treat it as: "Analyze the following content for key insights"
+        prompt = (
+            "You are an advanced reasoning model (Gemini 2.0 Flash Thinking). "
+            "Analyze the following text for key insights, patterns, or relevant facts. "
+            "Elaborate on major findings.\n\n"
+            f"CONTENT:\n{content}\n\n"
+            "Please provide your analysis below:"
+        )
+        response = chat_session.send_message(prompt)
+        return {
+            "analysis": response.text,
+            "insights": self._extract_insights(response.text)
+        }
+
+    def _extract_insights(self, analysis_text: str) -> List[str]:
         """
-        Basic extraction of bullet points or numbered lines from the analysis text.
+        Basic extraction of bullet points or lines from the analysis text.
         """
-        lines = analysis.split("\n")
+        lines = analysis_text.split("\n")
         insights = []
-        
         for line in lines:
             line = line.strip()
-            # Look for bullet or numbered items
-            if (line.startswith("-") or line.startswith("*") or 
-                line.startswith("•") or (line[:2].isdigit() and line[2] in [".", ")"])):
+            if (
+                line.startswith("-") or line.startswith("*") or 
+                line.startswith("•") or (len(line) > 2 and line[:2].isdigit())
+            ):
                 insights.append(line.lstrip("-*•").strip())
-        
+
         return insights
         
     def _combine_chunk_results(self, chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -342,100 +344,64 @@ class ReasoningAgent(BaseAgent):
             "chunk_count": len(chunk_results)
         }
 
-    def _identify_knowledge_gaps(
-        self,
-        question: str,
-        current_analysis: str
-    ) -> List[Dict[str, Any]]:
+    def _identify_knowledge_gaps(self, question: str, current_analysis: str) -> List[Dict[str, Any]]:
         """
-        Analyze current findings to identify what information is still missing.
-        Uses deepseek to compare the question against current analysis.
+        Use Gemini to identify gaps in current knowledge and suggest next steps.
         """
+        model = genai.GenerativeModel(
+            model_name=self.model_name,
+            generation_config=self.generation_config
+        )
+        chat_session = model.start_chat(history=[])
+
+        prompt = (
+            "You are an advanced research assistant. Given a research question and current analysis, "
+            "identify gaps in knowledge and suggest specific next steps (either search queries or URLs to explore).\n\n"
+            f"QUESTION: {question}\n\n"
+            f"CURRENT ANALYSIS:\n{current_analysis}\n\n"
+            "Please provide your suggestions in valid JSON format with this structure:\n"
+            "[{\"type\": \"search\"|\"explore\", \"query\"|\"url\": \"...\", \"rationale\": \"...\"}]\n"
+            "No extra text, only the JSON array."
+        )
+        response = chat_session.send_message(prompt)
+        content_str = response.text.strip()
+
         try:
-            response = self.deepseek_client.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an advanced research analyst. "
-                            "Compare the research question against current findings "
-                            "to identify what key information is still missing. "
-                            "Return a JSON array of knowledge gaps, where each gap has:"
-                            "- type: 'search' or 'explore'"
-                            "- query: search query to fill gap (if type=search)"
-                            "- url: URL to explore (if type=explore)"
-                            "- rationale: why this information is needed"
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Question: {question}\n\nCurrent Analysis:\n{current_analysis}"
-                    }
-                ],
-                temperature=0.7
-            )
-            
-            # Parse the response into a list of gaps
-            try:
-                import json
-                gaps = json.loads(response.choices[0].message.content)
-                if isinstance(gaps, list):
-                    return gaps
-            except:
-                # If parsing fails, return an empty list
-                return []
-                
+            gaps = json.loads(content_str)
+            if not isinstance(gaps, list):
+                raise ValueError("Expected a JSON list.")
+            return gaps
         except Exception as e:
-            rprint(f"[red]Error identifying knowledge gaps: {e}[/red]")
+            logger.error("Error parsing knowledge gaps from Gemini: %s", e)
             return []
     
     def _should_terminate(self, context: ResearchContext) -> bool:
         """
-        Decide if we have sufficient information to answer the question.
+        Use Gemini to decide if the research question has been sufficiently answered.
         """
-        # Get all analysis content
         analysis_items = context.get_content("main", ContentType.ANALYSIS)
-        if not analysis_items:
+        if len(analysis_items) < 3:  # Need some minimum analysis
             return False
-        
+
+        model = genai.GenerativeModel(
+            model_name=self.model_name,
+            generation_config=self.generation_config
+        )
+        chat_session = model.start_chat(history=[])
+
         # Combine all analysis
-        combined_analysis = " ".join(str(a.content) for a in analysis_items)
-        
-        try:
-            # Ask deepseek if we have enough info
-            response = self.deepseek_client.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a research completion analyst. "
-                            "Evaluate if we have sufficient information to answer "
-                            "the original question. Consider:"
-                            "1. Are all key aspects addressed?"
-                            "2. Is the information detailed enough?"
-                            "3. Are there any major gaps?"
-                            "Return a JSON with:"
-                            "- complete: true/false"
-                            "- confidence: 0-1"
-                            "- missing: list of missing elements (if any)"
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Question: {context.initial_question}\n\nFindings:\n{combined_analysis}"
-                    }
-                ],
-                temperature=0.7
-            )
-            
-            try:
-                result = json.loads(response.choices[0].message.content)
-                return result.get("complete", False) and result.get("confidence", 0) >= 0.8
-            except:
-                return False
-                
-        except Exception as e:
-            rprint(f"[red]Error checking termination: {e}[/red]")
-            return False
+        combined_analysis = "\n".join(
+            str(item.content.get("analysis", "")) for item in analysis_items
+        )
+
+        prompt = (
+            "You are an advanced research assistant. Given a research question and the current analysis, "
+            "determine if the question has been sufficiently answered.\n\n"
+            f"QUESTION: {context.initial_question}\n\n"
+            f"CURRENT ANALYSIS:\n{combined_analysis}\n\n"
+            "Respond with a single word: YES if the question is sufficiently answered, NO if not."
+        )
+        response = chat_session.send_message(prompt)
+        answer = response.text.strip().upper()
+
+        return answer == "YES"
