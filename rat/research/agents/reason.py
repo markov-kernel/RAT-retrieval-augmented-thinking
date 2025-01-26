@@ -51,33 +51,32 @@ class AnalysisTask:
 
 class ReasoningAgent(BaseAgent):
     """
-    Agent responsible for analyzing content using the Gemini 2.0 Flash Thinking model
-    and for driving the overall research flow.
-    
-    - Splits content into chunks if exceeding the input token limit (1,048,576).
-    - Runs parallel analysis with multiple calls to Gemini if needed.
-    - Merges results and can produce further decisions (SEARCH, EXPLORE) if needed.
-    - Potentially decides when to TERMINATE.
+    Reasoning agent for analyzing research content using the Gemini 2.0 Flash Thinking model.
+    Now it also acts as the "lead agent" that decides next steps (search, explore, etc.).
+    Supports parallel processing of content analysis and decision making.
     """
     
-    def __init__(self, config=None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        """Initialize the reasoning agent."""
         super().__init__("reason", config)
         
+        # Configure Gemini model
+        self.generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 50000,
+            "response_mime_type": "text/plain"
+        }
+        self.model_name = "gemini-2.0-flash-thinking-exp-01-21"
+
+        # Initialize the model
+        self._model = None
+
         # Initialize logger
         self.logger = logging.getLogger(__name__)
 
         # Configure the Gemini client
         genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-
-        # We'll store these generation settings to pass each call
-        self.generation_config = {
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "top_k": 64,
-            "max_output_tokens": 65536,       # Up to 65k tokens out
-            "response_mime_type": "text/plain"
-        }
-        self.model_name = "gemini-2.0-flash-thinking-exp-01-21"
 
         # We'll chunk input up to a 1,048,576 token estimate
         self.max_tokens_per_call = 1048576  
@@ -107,6 +106,20 @@ class ReasoningAgent(BaseAgent):
         # Tracking
         self.analysis_tasks: Dict[str, AnalysisTask] = {}
         
+    @property
+    def model(self):
+        """Lazy initialization of the Gemini model."""
+        if self._model is None:
+            self._model = genai.GenerativeModel(
+                model_name=self.model_name,
+                generation_config=self.generation_config
+            )
+        return self._model
+
+    def _get_model(self) -> genai.GenerativeModel:
+        """Get or create the Gemini model instance."""
+        return self.model  # Use the property
+
     def _enforce_flash_fix_limit(self):
         """
         Ensure we do not exceed flash_fix_rate_limit requests per minute.
@@ -381,10 +394,7 @@ class ReasoningAgent(BaseAgent):
         self._enforce_rate_limit()
         
         # Create a chat session
-        model = genai.GenerativeModel(
-            model_name=self.model_name,
-            generation_config=self.generation_config
-        )
+        model = self._get_model()
         chat_session = model.start_chat(history=[])
 
         # We explicitly instruct the model to avoid placeholders and next steps
@@ -502,10 +512,7 @@ class ReasoningAgent(BaseAgent):
         api_logger.debug(f"Prompt: {prompt}")
         
         try:
-            model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config=self.generation_config
-            )
+            model = self._get_model()
             chat = model.start_chat(history=[])
             response = chat.send_message(prompt)
             
