@@ -412,7 +412,7 @@ class ResearchOrchestrator:
             - Tables if relevant
             - Detailed comparisons and references
 
-            Return ONLY Markdown. No extra JSON or placeholders.
+            Return ONLY Markdown. RULE: ensure that all tables are valid Markdown tables. That is critical. No extra JSON or placeholders.
 
             RESEARCH CORPUS:
             {big_text}
