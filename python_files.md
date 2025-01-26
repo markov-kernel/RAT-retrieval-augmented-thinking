@@ -628,6 +628,12 @@ class ResearchContext:
 Explore agent for managing URL content extraction using Firecrawl.
 Handles webpage scraping, content cleaning, and metadata extraction.
 Supports parallel URL exploration with rate limiting and retries.
+
+Key Features:
+1. Smart URL grouping by domain
+2. Batch scraping for multiple URLs from same domain
+3. Rate limiting and retry logic
+4. Optional structured data extraction
 """
 
 from typing import List, Dict, Any, Optional, Set
@@ -692,6 +698,10 @@ class ExploreAgent(BaseAgent):
         self.retry_delay = self.config.get("retry_delay", 1.0)  # seconds
         self.max_parallel_domains = self.config.get("max_parallel_domains", 3)
         
+        # Batch scraping config
+        self.use_batch_scrape_threshold = self.config.get("use_batch_scrape_threshold", 3)
+        self.max_urls_per_batch = self.config.get("max_urls_per_batch", 10)
+        
         # Domain rate limiting
         self._domain_requests: Dict[str, List[float]] = {}
         self._domain_lock = threading.Lock()
@@ -751,21 +761,41 @@ class ExploreAgent(BaseAgent):
             # Sort URLs by priority within each domain
             urls.sort(key=lambda x: x["priority"], reverse=True)
             
-            # Take top N URLs per domain based on priority
-            for url_info in urls[:self.max_parallel_domains]:
+            # If we have enough URLs for this domain, use batch scraping
+            if len(urls) >= self.use_batch_scrape_threshold:
+                # Take top N URLs for batch processing
+                batch_urls = urls[:self.max_urls_per_batch]
                 decisions.append(
                     ResearchDecision(
                         decision_type=DecisionType.EXPLORE,
-                        priority=url_info["priority"],
+                        priority=max(u["priority"] for u in batch_urls),
                         context={
-                            "url": url_info["url"],
-                            "source_query_id": url_info["query_id"],
-                            "rationale": url_info["rationale"],
-                            "domain": domain
+                            "urls": [u["url"] for u in batch_urls],
+                            "source_query_ids": [u["query_id"] for u in batch_urls],
+                            "rationale": f"Batch scraping {len(batch_urls)} URLs from domain {domain}",
+                            "domain": domain,
+                            "is_batch": True
                         },
-                        rationale=f"Parallel exploration of domain {domain}"
+                        rationale=f"Batch exploration of domain {domain}"
                     )
                 )
+            else:
+                # Otherwise use single-page scraping for each URL
+                for url_info in urls[:self.max_parallel_domains]:
+                    decisions.append(
+                        ResearchDecision(
+                            decision_type=DecisionType.EXPLORE,
+                            priority=url_info["priority"],
+                            context={
+                                "url": url_info["url"],
+                                "source_query_id": url_info["query_id"],
+                                "rationale": url_info["rationale"],
+                                "domain": domain,
+                                "is_batch": False
+                            },
+                            rationale=f"Single-page exploration: {url_info['url']}"
+                        )
+                    )
         
         return decisions
         
@@ -784,67 +814,140 @@ class ExploreAgent(BaseAgent):
     def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
         """
         Execute a URL exploration decision with retries and rate limiting.
+        Supports both single-page and batch scraping.
         """
         start_time = time.time()
         success = False
         results = {}
         
         try:
-            url = decision.context["url"]
             domain = decision.context["domain"]
+            is_batch = decision.context.get("is_batch", False)
             
             # Check domain rate limits
             if not self._check_domain_rate_limit(domain):
                 rprint(f"[yellow]ExploreAgent: Rate limit hit for domain {domain}[/yellow]")
                 time.sleep(1.0)  # Basic backoff
             
-            # Execute with retries
-            for attempt in range(self.max_retries):
-                try:
-                    results = self.firecrawl.extract_content(url)
-                    break
-                except Exception as e:
-                    if attempt < self.max_retries - 1:
-                        rprint(f"[yellow]ExploreAgent: Retry {attempt + 1} for {url}: {e}[/yellow]")
-                        time.sleep(self.retry_delay)
-                    else:
-                        raise
-            
-            # Track exploration with thread safety
-            with self._url_lock:
-                self.explored_urls[url] = ExplorationTarget(
-                    url=url,
-                    priority=decision.priority,
-                    rationale=decision.context["rationale"],
-                    source_query_id=decision.context.get("source_query_id"),
-                    status="completed",
-                    results=results
-                )
-            
-            success = bool(results.get("text"))
-            if success:
-                rprint(f"[green]ExploreAgent: Content extracted from {url}[/green]")
+            if is_batch:
+                # Batch scraping
+                urls = decision.context["urls"]
+                source_query_ids = decision.context.get("source_query_ids", [None] * len(urls))
+                
+                # Execute batch scrape with retries
+                for attempt in range(self.max_retries):
+                    try:
+                        batch_results = self.firecrawl.scrape_urls_batch(urls)
+                        break
+                    except Exception as e:
+                        if attempt < self.max_retries - 1:
+                            rprint(f"[yellow]ExploreAgent: Retry {attempt + 1} for batch: {e}[/yellow]")
+                            time.sleep(self.retry_delay)
+                        else:
+                            raise
+                
+                # Track each URL's results
+                with self._url_lock:
+                    for url, result, query_id in zip(urls, batch_results, source_query_ids):
+                        self.explored_urls[url] = ExplorationTarget(
+                            url=url,
+                            priority=decision.priority,
+                            rationale=decision.context["rationale"],
+                            source_query_id=query_id,
+                            status="completed",
+                            results=result
+                        )
+                
+                # Return combined results
+                results = {
+                    "batch_results": batch_results,
+                    "urls": urls,
+                    "domain": domain
+                }
+                success = True
+                rprint(f"[green]ExploreAgent: Batch-scraped {len(urls)} URLs from {domain}[/green]")
+                
             else:
-                rprint(f"[yellow]ExploreAgent: No content extracted from {url}[/yellow]")
+                # Single-page scraping
+                url = decision.context["url"]
+                
+                # Execute with retries
+                for attempt in range(self.max_retries):
+                    try:
+                        results = self.firecrawl.extract_content(url)
+                        break
+                    except Exception as e:
+                        if attempt < self.max_retries - 1:
+                            rprint(f"[yellow]ExploreAgent: Retry {attempt + 1} for {url}: {e}[/yellow]")
+                            time.sleep(self.retry_delay)
+                        else:
+                            raise
+                
+                # Track exploration
+                with self._url_lock:
+                    self.explored_urls[url] = ExplorationTarget(
+                        url=url,
+                        priority=decision.priority,
+                        rationale=decision.context["rationale"],
+                        source_query_id=decision.context.get("source_query_id"),
+                        status="completed",
+                        results=results
+                    )
+                
+                success = bool(results.get("text"))
+                if success:
+                    rprint(f"[green]ExploreAgent: Content extracted from {url}[/green]")
+                else:
+                    rprint(f"[yellow]ExploreAgent: No content extracted from {url}[/yellow]")
                 
         except Exception as e:
             rprint(f"[red]ExploreAgent error: {str(e)}[/red]")
-            results = {
-                "error": str(e),
-                "text": "",
-                "metadata": {"url": decision.context.get("url", "")}
-            }
             
-            # Log failed exploration
-            with self._url_lock:
-                self.explored_urls[url] = ExplorationTarget(
-                    url=url,
-                    priority=decision.priority,
-                    rationale=decision.context["rationale"],
-                    source_query_id=decision.context.get("source_query_id"),
-                    status="failed",
-                    results=results
-                )
+            if decision.context.get("is_batch"):
+                # For batch failures, create error results for each URL
+                urls = decision.context["urls"]
+                results = {
+                    "batch_results": [
+                        {
+                            "error": str(e),
+                            "text": "",
+                            "metadata": {"url": url}
+                        }
+                        for url in urls
+                    ],
+                    "urls": urls,
+                    "domain": domain
+                }
+                
+                # Mark all URLs as failed
+                with self._url_lock:
+                    for url in urls:
+                        self.explored_urls[url] = ExplorationTarget(
+                            url=url,
+                            priority=decision.priority,
+                            rationale=decision.context["rationale"],
+                            source_query_id=None,
+                            status="failed",
+                            results={"error": str(e), "text": "", "metadata": {"url": url}}
+                        )
+            else:
+                # Single URL failure
+                url = decision.context["url"]
+                results = {
+                    "error": str(e),
+                    "text": "",
+                    "metadata": {"url": url}
+                }
+                
+                with self._url_lock:
+                    self.explored_urls[url] = ExplorationTarget(
+                        url=url,
+                        priority=decision.priority,
+                        rationale=decision.context["rationale"],
+                        source_query_id=decision.context.get("source_query_id"),
+                        status="failed",
+                        results=results
+                    )
             
         finally:
             execution_time = time.time() - start_time
@@ -875,19 +978,21 @@ class ExploreAgent(BaseAgent):
     
     def _is_valid_url(self, url: str) -> bool:
         """
-        Validate a URL for exploration.
+        Validate a URL.
         
         Args:
             url: URL to validate
             
         Returns:
-            True if the URL is valid and allowed
+            True if URL is valid
         """
         try:
+            if not url:
+                return False
+                
+            # Basic URL parsing
             parsed = urlparse(url)
-            
-            # Basic validation
-            if not all([parsed.scheme, parsed.netloc]):
+            if not parsed.netloc:
                 return False
                 
             # Check allowed domains if specified
@@ -895,7 +1000,7 @@ class ExploreAgent(BaseAgent):
                 domain = parsed.netloc.lower()
                 if not any(domain.endswith(d.lower()) for d in self.allowed_domains):
                     return False
-                    
+            
             return True
             
         except Exception:
@@ -1182,79 +1287,170 @@ class ReasoningAgent(BaseAgent):
     
     def _analyze_content_chunk(self, content: str, content_type: str) -> Dict[str, Any]:
         """
-        1) Instruct deepseek-reasoner to produce JSON with 'analysis' & 'insights'
-        2) Attempt to parse as JSON
-        3) If malformed, pass the text to deepseek-chat with response_format={'type':'json_object'}
-           to correct it into valid JSON.
-        4) Return final dict with 'analysis' & 'insights' keys
+        Analyze a chunk of content using DeepSeek.
+        Handles both single-page and batch exploration results.
         """
         try:
-            logger.debug(
-                "Sending chunk (length=%d chars) to DeepSeek reasoner with max_tokens=%d",
-                len(content), self.max_output_tokens
-            )
-
-            # We'll ask reasoner for JSON, but it might be invalid. 
-            reasoner_response = self.deepseek_reasoner.chat.completions.create(
-                model="deepseek-reasoner",
-                messages=[
+            # Prepare the content for analysis
+            if content_type == ContentType.EXPLORED_CONTENT.value:
+                # Parse the content if it's a string
+                if isinstance(content, str):
+                    content = json.loads(content)
+                
+                # Handle batch exploration results
+                if isinstance(content, dict) and content.get("type") == "batch_exploration":
+                    # Special handling for batch results
+                    domain = content.get("domain", "")
+                    urls = content.get("urls", [])
+                    batch_results = content.get("results", [])
+                    
+                    # Analyze each result in the batch
+                    combined_analysis = []
+                    combined_insights = []
+                    
+                    for idx, (url, result) in enumerate(zip(urls, batch_results)):
+                        # Skip empty or error results
+                        if not result or "error" in result:
+                            continue
+                            
+                        # Analyze the individual page
+                        page_analysis = self._analyze_single_page(result, url)
+                        if page_analysis:
+                            combined_analysis.append(
+                                f"Page {idx + 1} ({url}):\n{page_analysis['analysis']}"
+                            )
+                            combined_insights.extend(page_analysis.get("insights", []))
+                    
+                    # Combine all analyses
+                    return {
+                        "analysis": "\n\n".join(combined_analysis),
+                        "insights": combined_insights,
+                        "content_type": content_type,
+                        "domain": domain,
+                        "url_count": len(urls),
+                        "successful_analyses": len(combined_analysis)
+                    }
+                else:
+                    # Single page result
+                    return self._analyze_single_page(content, content.get("metadata", {}).get("url", ""))
+            else:
+                # Handle search results or other content types
+                messages = [
                     {
                         "role": "system",
                         "content": (
-                            "You are an advanced deepseek-reasoner model. "
-                            "Analyze the following content for key insights, patterns, or relevant facts, "
-                            "and produce JSON in the format:\n"
-                            "{\n  \"analysis\": \"...\",\n  \"insights\": [\"...\", \"...\"]\n}\n"
-                            "Note: your JSON might be incomplete or malformed, which we'll fix afterwards."
+                            "You are an expert research analyst. Analyze the following content "
+                            "and provide insights. Format your response as JSON with 'analysis' "
+                            "and 'insights' fields. Keep insights concise and focused."
                         )
                     },
                     {
                         "role": "user",
-                        "content": f"Content type: {content_type}\n\nContent:\n{content}"
+                        "content": f"Content type: {content_type}\n\nContent to analyze:\n{content}"
                     }
-                ],
-                temperature=0.7,
-                max_tokens=self.max_output_tokens,
-                stream=False
-            )
-
-            raw_text = reasoner_response.choices[0].message.content
-
-            # Now attempt to parse it as JSON
-            try:
-                parsed = json.loads(raw_text)
-                # If success, return it directly
-                return {
-                    "analysis": parsed.get("analysis", ""),
-                    "insights": parsed.get("insights", []),
-                    "content_type": content_type
-                }
-            except json.JSONDecodeError:
-                # If parsing fails, transform it with deepseek-chat
-                corrected_json_str = self._transform_malformed_json_with_chat(raw_text)
+                ]
+                
+                response = self.deepseek_reasoner.chat.completions.create(
+                    model="deepseek-reasoner",
+                    messages=messages,
+                    max_tokens=self.max_output_tokens,
+                    temperature=0.3,
+                    timeout=self.request_timeout
+                )
+                
                 try:
-                    repaired = json.loads(corrected_json_str)
+                    result_text = response.choices[0].message.content
+                    result_json = json.loads(result_text)
                     return {
-                        "analysis": repaired.get("analysis", ""),
-                        "insights": repaired.get("insights", []),
+                        **result_json,
                         "content_type": content_type
                     }
-                except Exception:
-                    # Fallback: store entire raw text
+                except json.JSONDecodeError:
+                    # If JSON is malformed, try to fix it with deepseek-chat
+                    fixed_json = self._transform_malformed_json_with_chat(result_text)
+                    result_json = json.loads(fixed_json)
                     return {
-                        "analysis": raw_text,
-                        "insights": [],
+                        **result_json,
                         "content_type": content_type
                     }
-
+                    
         except Exception as e:
-            rprint(f"[red]DeepSeek reasoner error: {str(e)}[/red]")
-            logger.exception("Error calling DeepSeek reasoner.")
+            logger.exception("Error analyzing content chunk")
             return {
+                "error": str(e),
                 "analysis": "",
                 "insights": [],
-                "content_type": content_type,
-                "error": str(e)
+                "content_type": content_type
+            }
+            
+    def _analyze_single_page(self, content: Dict[str, Any], url: str) -> Dict[str, Any]:
+        """
+        Analyze a single webpage's content.
+        
+        Args:
+            content: The page content and metadata
+            url: The source URL
+            
+        Returns:
+            Analysis results for the page
+        """
+        try:
+            # Extract the relevant content
+            title = content.get("title", "")
+            text = content.get("text", "")
+            metadata = content.get("metadata", {})
+            
+            # Prepare the content for analysis
+            page_content = f"Title: {title}\n\nURL: {url}\n\nContent:\n{text}"
+            
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert research analyst. Analyze the following webpage "
+                        "content and provide insights. Format your response as JSON with "
+                        "'analysis' and 'insights' fields. Keep insights concise and focused."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": page_content
+                }
+            ]
+            
+            response = self.deepseek_reasoner.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=messages,
+                max_tokens=self.max_output_tokens,
+                temperature=0.3,
+                timeout=self.request_timeout
+            )
+            
+            try:
+                result_text = response.choices[0].message.content
+                result_json = json.loads(result_text)
+                return {
+                    **result_json,
+                    "url": url,
+                    "metadata": metadata
+                }
+            except json.JSONDecodeError:
+                # If JSON is malformed, try to fix it with deepseek-chat
+                fixed_json = self._transform_malformed_json_with_chat(result_text)
+                result_json = json.loads(fixed_json)
+                return {
+                    **result_json,
+                    "url": url,
+                    "metadata": metadata
+                }
+                
+        except Exception as e:
+            logger.exception("Error analyzing single page: %s", url)
+            return {
+                "error": str(e),
+                "analysis": "",
+                "insights": [],
+                "url": url
             }
 
     def _transform_malformed_json_with_chat(self, possibly_malformed: str) -> str:
@@ -1735,10 +1931,16 @@ class SearchAgent(BaseAgent):
 Firecrawl client for web scraping functionality.
 This module handles interactions with the Firecrawl API for extracting content
 from web pages and processing the extracted data.
+
+Key Features:
+1. Single-page extraction (primary /scrape endpoint)
+2. Batch scraping for multiple URLs
+3. Optional LLM-based structured data extraction
+4. Content cleaning and formatting
 """
 
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 from rich import print as rprint
 from firecrawl import FirecrawlApp
@@ -1768,7 +1970,8 @@ class FirecrawlClient:
         
     def extract_content(self, url: str) -> Dict[str, Any]:
         """
-        Extract content from a webpage using Firecrawl API.
+        Extract content from a single webpage using Firecrawl's /scrape endpoint.
+        This is the primary method for single-page extraction, returning markdown.
         
         Args:
             url: The URL to scrape
@@ -1781,22 +1984,22 @@ class FirecrawlClient:
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
             
-            logger.info("Extracting content from URL: %s", url)
+            logger.info("Extracting content from URL: %s (single scrape)", url)
             
             # Make the request to scrape the URL with timeout
             result = self.app.scrape_url(
                 url,
                 params={
                     'formats': ['markdown'],
-                    'request_timeout': self.request_timeout  # Pass timeout in params
+                    'request_timeout': self.request_timeout
                 }
             )
             
             return self._process_extracted_content(result.get('data', {}), url)
             
         except Exception as e:
-            rprint(f"[red]Firecrawl API request failed for {url}: {str(e)}[/red]")
-            logger.exception("Error extracting content from URL: %s", url)
+            rprint(f"[red]Firecrawl API request failed (single scrape) for {url}: {str(e)}[/red]")
+            logger.exception("Error extracting content from URL (single scrape): %s", url)
             return {
                 "title": "",
                 "text": "",
@@ -1804,6 +2007,119 @@ class FirecrawlClient:
                     "url": url,
                     "error": str(e)
                 }
+            }
+
+    def scrape_urls_batch(self, urls: List[str]) -> List[Dict[str, Any]]:
+        """
+        Batch scrape multiple URLs in one Firecrawl call using /batch/scrape.
+        More efficient than multiple single-page scrapes when you have several URLs.
+        
+        Args:
+            urls: List of URLs to scrape
+            
+        Returns:
+            List of processed results, one per URL (preserving order)
+        """
+        if not urls:
+            return []
+            
+        logger.info("Batch-scraping %d URLs", len(urls))
+        
+        try:
+            # Ensure all URLs have protocols
+            urls = [
+                f"https://{url}" if not url.startswith(('http://', 'https://')) else url
+                for url in urls
+            ]
+            
+            # Call Firecrawl batch scrape
+            result = self.app.batch_scrape_urls(
+                urls,
+                params={
+                    'formats': ['markdown'],
+                    'request_timeout': self.request_timeout
+                }
+            )
+            
+            # Process each page in the batch
+            batch_data = result.get('data', [])
+            processed_results = []
+            
+            for page_data in batch_data:
+                # Each page_data is similar to a single scrape result
+                processed = self._process_extracted_content(
+                    page_data,
+                    page_data.get('metadata', {}).get('sourceURL', '')
+                )
+                processed_results.append(processed)
+                
+            return processed_results
+            
+        except Exception as e:
+            rprint(f"[red]Firecrawl batch scrape failed: {str(e)}[/red]")
+            logger.exception("Error in batch_scrape_urls for URLs: %s", urls)
+            # Return empty results for all URLs
+            return [
+                {
+                    "title": "",
+                    "text": "",
+                    "metadata": {
+                        "url": url,
+                        "error": str(e)
+                    }
+                }
+                for url in urls
+            ]
+
+    def extract_data(self, url: str, prompt: str) -> Dict[str, Any]:
+        """
+        Extract structured data from a webpage using Firecrawl's LLM capabilities.
+        Uses the /scrape endpoint with formats=['json'] and a custom prompt.
+        
+        Args:
+            url: The URL to extract data from
+            prompt: Instructions for the LLM about what data to extract
+            
+        Returns:
+            Dict containing the extracted structured data and metadata
+        """
+        try:
+            logger.info(
+                "Extracting structured data from URL: %s with prompt='%s'",
+                url, prompt
+            )
+            
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+            
+            result = self.app.scrape_url(
+                url,
+                params={
+                    'formats': ['json'],
+                    'jsonOptions': {
+                        'prompt': prompt
+                    },
+                    'request_timeout': self.request_timeout
+                }
+            )
+            
+            data = result.get('data', {})
+            extracted = data.get('json', {})
+            meta = data.get('metadata', {})
+            
+            return {
+                'url': meta.get('sourceURL', url),
+                'extracted_fields': extracted,
+                'metadata': meta
+            }
+            
+        except Exception as e:
+            rprint(f"[red]Firecrawl structured extraction failed for {url}: {str(e)}[/red]")
+            logger.exception("Error extracting structured data from URL: %s", url)
+            return {
+                'url': url,
+                'extracted_fields': {},
+                'metadata': {'error': str(e)}
             }
             
     def _process_extracted_content(self, data: Dict[str, Any], original_url: str) -> Dict[str, Any]:
@@ -1822,21 +2138,17 @@ class FirecrawlClient:
         
         processed = {
             "title": metadata.get("title", metadata.get("ogTitle", "")),
-            "text": markdown_content,
+            "text": self._clean_text(markdown_content),
             "metadata": {
                 "url": metadata.get("sourceURL", original_url),
                 "author": metadata.get("author", ""),
-                "published_date": "",  # Firecrawl doesn't provide this directly
+                "published_date": metadata.get("publishedDate", ""),
                 "domain": metadata.get("ogSiteName", ""),
                 "word_count": len(markdown_content.split()) if markdown_content else 0,
                 "language": metadata.get("language", ""),
                 "status_code": metadata.get("statusCode", 200)
             }
         }
-        
-        # Clean and format the text if needed
-        if processed["text"]:
-            processed["text"] = self._clean_text(processed["text"])
         
         return processed
         
@@ -2316,18 +2628,53 @@ class ResearchOrchestrator:
                 priority=decision.priority
             )
         elif decision.decision_type == DecisionType.EXPLORE:
-            content_str = json.dumps(result)
-            token_count = self.current_context._estimate_tokens(content_str)
-            return ContentItem(
-                content_type=ContentType.EXPLORED_CONTENT,
-                content=result,
-                metadata={
-                    "decision_type": decision.decision_type.value,
-                    "iteration": iteration_number
-                },
-                token_count=token_count,
-                priority=decision.priority
-            )
+            # Handle both single-page and batch exploration results
+            if "batch_results" in result:
+                # For batch results, create a combined content item
+                batch_results = result["batch_results"]
+                urls = result.get("urls", [])
+                domain = result.get("domain", "")
+                
+                # Combine the batch results into a single content item
+                combined_content = {
+                    "type": "batch_exploration",
+                    "domain": domain,
+                    "urls": urls,
+                    "results": batch_results
+                }
+                
+                content_str = json.dumps(combined_content)
+                token_count = self.current_context._estimate_tokens(content_str)
+                
+                return ContentItem(
+                    content_type=ContentType.EXPLORED_CONTENT,
+                    content=combined_content,
+                    metadata={
+                        "decision_type": decision.decision_type.value,
+                        "iteration": iteration_number,
+                        "is_batch": True,
+                        "domain": domain,
+                        "url_count": len(urls)
+                    },
+                    token_count=token_count,
+                    priority=decision.priority
+                )
+            else:
+                # Single-page exploration result
+                content_str = json.dumps(result)
+                token_count = self.current_context._estimate_tokens(content_str)
+                return ContentItem(
+                    content_type=ContentType.EXPLORED_CONTENT,
+                    content=result,
+                    metadata={
+                        "decision_type": decision.decision_type.value,
+                        "iteration": iteration_number,
+                        "is_batch": False,
+                        "url": result.get("metadata", {}).get("url", "")
+                    },
+                    token_count=token_count,
+                    priority=decision.priority
+                )
         elif decision.decision_type == DecisionType.REASON:
             content_str = json.dumps(result)
             token_count = self.current_context._estimate_tokens(content_str)
@@ -2341,12 +2688,11 @@ class ResearchOrchestrator:
                 token_count=token_count,
                 priority=decision.priority
             )
-        else:
-            # TERMINATE or any fallback
+        elif decision.decision_type == DecisionType.TERMINATE:
             content_str = json.dumps(result)
             token_count = self.current_context._estimate_tokens(content_str)
             return ContentItem(
-                content_type=ContentType.OTHER,
+                content_type=ContentType.FINAL_ANALYSIS,
                 content=result,
                 metadata={
                     "decision_type": decision.decision_type.value,
@@ -2355,6 +2701,8 @@ class ResearchOrchestrator:
                 token_count=token_count,
                 priority=decision.priority
             )
+        else:
+            raise ValueError(f"Unknown decision type: {decision.decision_type}")
 
     def _should_terminate(self, iteration: ResearchIteration) -> bool:
         logger.debug(

@@ -25,8 +25,8 @@ class PerplexityClient:
 
         # Configuration
         self.config = config or {}
-        self.model = self.config.get("model", "sonar")
-        self.request_timeout = self.config.get("request_timeout", 60)  # 60s default
+        self.model = self.config.get("model", "sonar-pro")
+        self.request_timeout = self.config.get("request_timeout", 120)  # 60s default
         self.system_message = "You are a research assistant helping to find accurate, up-to-date information."
         
         logger.info(
