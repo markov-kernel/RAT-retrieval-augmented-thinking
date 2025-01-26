@@ -5,98 +5,140 @@ Uses the Perplexity API to perform intelligent web searches and extract relevant
 
 import os
 import re
-from openai import OpenAI
-from typing import List, Dict, Any
-from rich import print as rprint
+import logging
+import requests
+from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 class PerplexityClient:
-    def __init__(self):
-        self.client = OpenAI(
-            api_key=os.getenv("PERPLEXITY_API_KEY"),
-            base_url="https://api.perplexity.ai"
-        )
+    """
+    A simple client that calls Perplexity's /chat/completions endpoint
+    using requests. See https://docs.perplexity.ai/api-reference/chat-completions
+    """
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.api_key = os.getenv("PERPLEXITY_API_KEY")
+        if not self.api_key:
+            raise ValueError("PERPLEXITY_API_KEY not set in environment variables.")
+        self.base_url = "https://api.perplexity.ai/chat/completions"
+
+        # Configuration
+        self.config = config or {}
+        self.model = self.config.get("model", "sonar")
+        self.request_timeout = self.config.get("request_timeout", 60)  # 60s default
+        self.system_message = "You are a research assistant helping to find accurate, up-to-date information."
         
-        self.model = "sonar-pro"
-        self.system_message = (
-            "You are a research assistant helping to find accurate and up-to-date information. "
-            "When providing information, always cite your sources in the format [Source: URL]. "
-            "Focus on finding specific, factual information and avoid speculation."
+        logger.info(
+            "PerplexityClient initialized with model=%s, timeout=%d",
+            self.model,
+            self.request_timeout
         )
-        
+
     def search(self, query: str) -> Dict[str, Any]:
         """
-        Perform a web search using the Perplexity API.
-        
-        Args:
-            query: The search query
-            
-        Returns:
-            Dict containing search results and extracted URLs
+        Perform a web search using the Perplexity /chat/completions API
+        by passing a short system message and a user message in the
+        'messages' array, along with any relevant parameters.
         """
+
+        # Build the messages array with system + user roles
+        messages = [
+            {
+                "role": "system",
+                "content": self.system_message
+            },
+            {
+                "role": "user",
+                "content": query
+            }
+        ]
+
+        # Prepare the JSON data to send
+        # (feel free to tweak parameters as needed, or add more)
+        data = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            # Example: filter the search domain, or remove it if you want all results
+            # "search_domain_filter": ["perplexity.ai"],
+            "return_images": False,
+            "return_related_questions": False,
+            "search_recency_filter": "month",
+            "top_k": 0,
+            "stream": False,
+            # presence_penalty and frequency_penalty can be adjusted as needed
+            "presence_penalty": 0,
+            "frequency_penalty": 1
+        }
+
+        # Log what we're about to send (for debug)
+        logger.info("Sending request to Perplexity with query='%s' and model=%s", query, self.model)
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_message},
-                    {"role": "user", "content": query}
-                ],
-                temperature=0.7,
-                stream=False
+            response = requests.post(
+                self.base_url,
+                headers=headers,
+                json=data,
+                timeout=self.request_timeout  # Add timeout to prevent hanging
             )
-            
-            content = response.choices[0].message.content
+            if not response.ok:
+                # Log and raise an error if the HTTP status is not 200
+                logger.error(
+                    "Perplexity API returned an error %d: %s",
+                    response.status_code,
+                    response.text
+                )
+                response.raise_for_status()
+
+            # Parse response JSON
+            resp_json = response.json()
+
+            # The assistant's text is typically in resp_json["choices"][0]["message"]["content"]
+            # We'll combine it in 'content' for consistency.
+            if "choices" in resp_json and len(resp_json["choices"]) > 0:
+                content = resp_json["choices"][0]["message"].get("content", "")
+            else:
+                content = ""
+
+            # Extract citations or references, if present
             urls = self._extract_urls(content)
-            
+            # Some Perplexity responses also have a top-level "citations" array
+            # to show references. We could merge them into `urls` if we like:
+            citations = resp_json.get("citations", [])
+            for citation_url in citations:
+                if citation_url not in urls:
+                    urls.append(citation_url)
+
             return {
                 "content": content,
                 "urls": urls
             }
-            
-        except Exception as e:
-            rprint(f"[red]Error in Perplexity search: {str(e)}[/red]")
+
+        except requests.RequestException as e:
+            logger.exception("Error in Perplexity search request:")
             return {
                 "content": "",
-                "urls": []
+                "urls": [],
+                "error": str(e)
             }
-            
+
     def _extract_urls(self, text: str) -> List[str]:
         """
-        Extract URLs from text, including those in citation format.
-        
-        Args:
-            text: Text to extract URLs from
-            
-        Returns:
-            List of extracted URLs
+        Extract URLs from any text. We also attempt to parse typical references like:
+        [Source: https://example.com]
         """
-        # Look for URLs in citation format [Source: URL]
-        citation_pattern = r'\[Source: (https?://[^\]]+)\]'
+        citation_pattern = r'\[Source:\s*(https?://[^\]]+)\]'
         citation_urls = re.findall(citation_pattern, text)
-        
-        # Also look for raw URLs
+
         url_pattern = r'https?://\S+'
         raw_urls = re.findall(url_pattern, text)
-        
-        # Combine and deduplicate URLs
+
         all_urls = list(set(citation_urls + raw_urls))
         return all_urls
-
-    def validate_url(self, url: str) -> bool:
-        """
-        Validate if a URL is accessible and safe to scrape.
-        """
-        import requests
-        from urllib.parse import urlparse
-        
-        try:
-            # Parse URL
-            parsed = urlparse(url)
-            if not all([parsed.scheme, parsed.netloc]):
-                return False
-                
-            # Check if URL is accessible
-            response = requests.head(url, timeout=5)
-            return response.status_code == 200
-            
-        except Exception:
-            return False 

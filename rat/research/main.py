@@ -6,6 +6,7 @@ Provides a command-line interface for conducting research using specialized agen
 import os
 import sys
 import json
+import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
@@ -20,6 +21,24 @@ from .orchestrator import ResearchOrchestrator
 from .output_manager import OutputManager
 
 console = Console()
+
+def setup_logging():
+    """
+    Configure logging so that logs are overwritten on each run.
+    """
+    log_path = "rat.log"
+    # Remove the log file if it exists, so we overwrite on every new run
+    if os.path.exists(log_path):
+        os.remove(log_path)
+
+    logging.basicConfig(
+        filename=log_path,
+        filemode="w",  # Overwrite mode
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+    
+    logging.info("Logger initialized. All logs will be written to rat.log and overwritten each run.")
 
 def load_config() -> Dict[str, Any]:
     """Load configuration from environment variables."""
@@ -96,14 +115,21 @@ def run_research(question: str, config: Dict[str, Any]) -> None:
     results = orchestrator.start_research(question)
     
     if "error" in results:
+        logger.error("Research error: %s", results['error'])
         console.print(f"[red]Research error: {results['error']}[/red]")
     else:
+        logger.info("Research completed successfully")
         console.print(Panel(Markdown(results["paper"]), title="Research Results", border_style="green"))
 
 def main():
     """Main entry point for the research system."""
     import argparse
     
+    # Setup logging once at startup
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    logger.info("Starting RAT main program...")
+
     parser = argparse.ArgumentParser(description="RAT - Retrieval Augmented Thinking")
     parser.add_argument("--interactive", "-i", action="store_true", 
                        help="Start in interactive mode")
@@ -116,6 +142,7 @@ def main():
     if args.interactive:
         display_welcome()
         commands = WordCompleter(['research', 'config', 'metrics', 'help', 'exit'])
+        
         orchestrator: Optional[ResearchOrchestrator] = None
         
         while True:
@@ -126,6 +153,7 @@ def main():
                     continue
                     
                 if user_input.lower() == 'exit':
+                    logger.info("User exited the interactive session")
                     console.print("[yellow]Exiting research system...[/yellow]")
                     break
                     
@@ -134,10 +162,12 @@ def main():
                     continue
                     
                 if user_input.lower() == 'config':
+                    logger.info("Displaying configuration")
                     console.print(Panel(json.dumps(config, indent=2), title="Configuration", border_style="cyan"))
                     continue
                     
                 if user_input.lower() == 'metrics' and orchestrator:
+                    logger.info("Calculating research metrics")
                     metrics = orchestrator._calculate_metrics(time.time())
                     console.print(Panel(json.dumps(metrics, indent=2), title="Research Metrics", border_style="magenta"))
                     continue
@@ -145,24 +175,29 @@ def main():
                 if user_input.lower().startswith('research '):
                     question = user_input[9:].strip()
                     if not question:
+                        logger.warning("Empty research question provided")
                         console.print("[red]Please provide a research question.[/red]")
                         continue
-                    
+                    logger.info("Starting research with question: %s", question)
                     run_research(question, config)
                     continue
                     
+                logger.warning("Unknown command received: %s", user_input)
                 console.print("[red]Unknown command. Type 'help' for available commands.[/red]")
                 
             except KeyboardInterrupt:
+                logger.info("Operation cancelled by user")
                 console.print("\n[yellow]Operation cancelled. Type 'exit' to quit.[/yellow]")
                 continue
                 
             except Exception as e:
+                logger.exception("Exception occurred in interactive loop")
                 console.print(f"[red]Error: {str(e)}[/red]")
                 continue
     else:
         if not args.question:
             parser.error("Research question is required when not in interactive mode")
+        logger.info("Starting non-interactive research with question: %s", args.question)
         run_research(args.question, config)
 
 if __name__ == '__main__':

@@ -5,20 +5,33 @@ from web pages and processing the extracted data.
 """
 
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 from rich import print as rprint
 from firecrawl import FirecrawlApp
+import logging
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 class FirecrawlClient:
-    def __init__(self):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.api_key = os.getenv("FIRECRAWL_API_KEY")
         if not self.api_key:
             raise ValueError("FIRECRAWL_API_KEY not found in environment variables")
         
+        # Configuration
+        self.config = config or {}
+        self.request_timeout = self.config.get("request_timeout", 60)  # 60s default
+        
+        # Initialize client (timeout will be used in requests)
         self.app = FirecrawlApp(api_key=self.api_key)
+        
+        logger.info(
+            "FirecrawlClient initialized with timeout=%d",
+            self.request_timeout
+        )
         
     def extract_content(self, url: str) -> Dict[str, Any]:
         """
@@ -35,11 +48,14 @@ class FirecrawlClient:
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
             
-            # Make the request to scrape the URL
+            logger.info("Extracting content from URL: %s", url)
+            
+            # Make the request to scrape the URL with timeout
             result = self.app.scrape_url(
                 url,
                 params={
                     'formats': ['markdown'],
+                    'request_timeout': self.request_timeout  # Pass timeout in params
                 }
             )
             
@@ -47,6 +63,7 @@ class FirecrawlClient:
             
         except Exception as e:
             rprint(f"[red]Firecrawl API request failed for {url}: {str(e)}[/red]")
+            logger.exception("Error extracting content from URL: %s", url)
             return {
                 "title": "",
                 "text": "",

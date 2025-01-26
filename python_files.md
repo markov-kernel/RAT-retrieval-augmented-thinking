@@ -54,7 +54,7 @@ if __name__ == '__main__':
 ```python
 """
 Multi-agent system for research orchestration.
-Provides specialized agents for search, exploration, reasoning, and code execution.
+Provides specialized agents for search, exploration, and reasoning.
 """
 
 from .base import BaseAgent, ResearchDecision, DecisionType
@@ -62,7 +62,6 @@ from .context import ResearchContext, ContextBranch, ContentType
 from .search import SearchAgent
 from .explore import ExploreAgent
 from .reason import ReasoningAgent
-from .execute import ExecutionAgent
 
 __all__ = [
     'BaseAgent',
@@ -73,8 +72,7 @@ __all__ = [
     'ContentType',
     'SearchAgent',
     'ExploreAgent',
-    'ReasoningAgent',
-    'ExecutionAgent'
+    'ReasoningAgent'
 ]
 ```
 
@@ -84,21 +82,24 @@ __all__ = [
 """
 Base agent interface and core decision-making structures.
 Defines the contract that all specialized research agents must implement.
+Includes support for parallel processing and concurrency control.
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from enum import Enum
 from rich import print as rprint
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 
 class DecisionType(Enum):
     """Types of decisions an agent can make during research."""
-    SEARCH = "search"  # New search query needed
-    EXPLORE = "explore"  # URL exploration needed
-    REASON = "reason"  # Deep analysis needed
-    EXECUTE = "execute"  # Code execution needed
-    TERMINATE = "terminate"  # Research complete
+    SEARCH = "search"      # New search query needed
+    EXPLORE = "explore"    # URL exploration needed
+    REASON = "reason"      # Deep analysis needed (deepseek-reasoner)
+    TERMINATE = "terminate"# Research complete or no further steps
 
 @dataclass
 class ResearchDecision:
@@ -110,22 +111,27 @@ class ResearchDecision:
         priority: Priority level (0-1) for this decision
         context: Additional context or parameters for the decision
         rationale: Explanation for why this decision was made
+        id: Optional unique identifier for tracking parallel tasks
     """
     decision_type: DecisionType
     priority: float
     context: Dict[str, Any]
     rationale: str
+    id: Optional[str] = None
     
     def __post_init__(self):
         if not 0 <= self.priority <= 1:
             raise ValueError("Priority must be between 0 and 1")
+        if not self.id:
+            self.id = f"{self.decision_type.value}_{time.time_ns()}"
 
 class BaseAgent(ABC):
     """
     Base class for all research agents.
     
-    Each specialized agent (search, explore, reason, execute) must implement
+    Each specialized agent (search, explore, reason) must implement
     the analyze method to make decisions based on the current research context.
+    Supports parallel execution of decisions with concurrency control.
     """
     
     def __init__(self, name: str, config: Optional[Dict[str, Any]] = None):
@@ -143,11 +149,24 @@ class BaseAgent(ABC):
             "decisions_made": 0,
             "successful_executions": 0,
             "failed_executions": 0,
-            "total_execution_time": 0.0
+            "total_execution_time": 0.0,
+            "parallel_executions": 0,
+            "max_concurrent_tasks": 0,
+            "rate_limit_delays": 0,
+            "retry_attempts": 0
         }
+        
+        # Concurrency controls
+        self.max_workers = self.config.get("max_workers", 5)
+        self.rate_limit = self.config.get("rate_limit", 100)  # requests per minute
+        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        self._active_tasks: Set[str] = set()
+        self._tasks_lock = threading.Lock()
+        self._last_request_time = 0
+        self._rate_limit_lock = threading.Lock()
     
     @abstractmethod
-    def analyze(self, context: 'ResearchContext') -> List[ResearchDecision]:
+    def analyze(self, context: 'ResearchContext') -> List['ResearchDecision']:
         """
         Analyze the current research context and make decisions.
         
@@ -159,7 +178,73 @@ class BaseAgent(ABC):
         """
         pass
     
-    def log_decision(self, decision: ResearchDecision, success: bool = True, execution_time: float = 0.0):
+    def execute_parallel(self, decisions: List['ResearchDecision']) -> List[Dict[str, Any]]:
+        """
+        Execute multiple decisions in parallel.
+        
+        Args:
+            decisions: List of decisions to execute
+            
+        Returns:
+            List of results from executing the decisions
+        """
+        if not decisions:
+            return []
+        
+        results = []
+        futures = {}
+        
+        try:
+            # Submit all tasks
+            for decision in decisions:
+                if self._can_start_task():
+                    future = self.executor.submit(self._execute_with_rate_limit, decision)
+                    futures[future] = decision
+                    with self._tasks_lock:
+                        self._active_tasks.add(decision.id)
+                        self.metrics["max_concurrent_tasks"] = max(
+                            self.metrics["max_concurrent_tasks"],
+                            len(self._active_tasks)
+                        )
+            
+            # Collect results as they complete
+            for future in futures:
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    rprint(f"[red]Error in parallel execution of {futures[future].id}: {e}[/red]")
+                    results.append({"error": str(e), "decision_id": futures[future].id})
+                finally:
+                    with self._tasks_lock:
+                        self._active_tasks.remove(futures[future].id)
+            
+            self.metrics["parallel_executions"] += len(decisions)
+            return results
+            
+        except Exception as e:
+            rprint(f"[red]Error in parallel execution batch: {e}[/red]")
+            return [{"error": str(e)}]
+    
+    def _can_start_task(self) -> bool:
+        """Check if we can start a new task based on concurrency limits."""
+        with self._tasks_lock:
+            return len(self._active_tasks) < self.max_workers
+    
+    def _execute_with_rate_limit(self, decision: 'ResearchDecision') -> Dict[str, Any]:
+        """Execute a decision with rate limiting."""
+        with self._rate_limit_lock:
+            current_time = time.time()
+            time_since_last = current_time - self._last_request_time
+            if time_since_last < (60 / self.rate_limit):
+                sleep_time = (60 / self.rate_limit) - time_since_last
+                self.metrics["rate_limit_delays"] += 1
+                time.sleep(sleep_time)
+            self._last_request_time = time.time()
+        
+        return self.execute_decision(decision)
+    
+    def log_decision(self, decision: 'ResearchDecision', success: bool = True, execution_time: float = 0.0):
         """
         Log a decision made by this agent and update metrics.
         
@@ -177,7 +262,7 @@ class BaseAgent(ABC):
         self.metrics["total_execution_time"] += execution_time
     
     @abstractmethod
-    def can_handle(self, decision: ResearchDecision) -> bool:
+    def can_handle(self, decision: 'ResearchDecision') -> bool:
         """
         Check if this agent can handle a given decision type.
         
@@ -190,7 +275,7 @@ class BaseAgent(ABC):
         pass
     
     @abstractmethod
-    def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
+    def execute_decision(self, decision: 'ResearchDecision') -> Dict[str, Any]:
         """
         Execute a decision made by this or another agent.
         
@@ -202,7 +287,7 @@ class BaseAgent(ABC):
         """
         pass
     
-    def get_decision_history(self) -> List[ResearchDecision]:
+    def get_decision_history(self) -> List['ResearchDecision']:
         """
         Get the history of decisions made by this agent.
         
@@ -222,6 +307,11 @@ class BaseAgent(ABC):
     
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name='{self.name}')"
+    
+    def __del__(self):
+        """Cleanup executor on deletion."""
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=True)
 ```
 
 ## rat/research/agents/context.py
@@ -265,7 +355,7 @@ class ContentItem:
         id: Unique identifier for this content item
     """
     content_type: ContentType
-    content: str
+    content: Any
     metadata: Dict[str, Any]
     token_count: int
     priority: float = 0.5
@@ -349,7 +439,7 @@ class ResearchContext:
                    branch_id: str,
                    content_item: Optional[ContentItem] = None,
                    content_type: Optional[ContentType] = None,
-                   content: Optional[str] = None,
+                   content: Optional[Any] = None,
                    metadata: Optional[Dict[str, Any]] = None,
                    token_count: Optional[int] = None,
                    priority: float = 0.5) -> ContentItem:
@@ -360,17 +450,7 @@ class ResearchContext:
         1. branch_id and content_item
         2. branch_id and individual parameters (content_type, content, metadata, etc.)
         
-        Args:
-            branch_id: Branch to add content to
-            content_item: Pre-constructed ContentItem (if provided, other params are ignored)
-            content_type: Type of content being added
-            content: The content text/data
-            metadata: Additional content metadata
-            token_count: Pre-computed token count (if available)
-            priority: Priority of this content (0-1), defaults to 0.5
-            
-        Returns:
-            The created/added content item
+        Raises ValueError if adding content would exceed the per-branch token limit.
         """
         if branch_id not in self.branches:
             raise ValueError(f"Branch {branch_id} not found")
@@ -379,33 +459,35 @@ class ResearchContext:
         
         if content_item:
             item = content_item
-            token_count = item.token_count
+            token_usage = item.token_count
         else:
             if content_type is None or content is None or metadata is None:
                 raise ValueError("Must provide either content_item or all of: content_type, content, metadata")
                 
             # Estimate tokens if not provided
             if token_count is None:
-                token_count = self._estimate_tokens(content)
+                token_usage = self._estimate_tokens(str(content))
+            else:
+                token_usage = token_count
                 
             # Create new content item
             item = ContentItem(
                 content_type=content_type,
                 content=content,
                 metadata=metadata,
-                token_count=token_count,
+                token_count=token_usage,
                 priority=priority
             )
             
         # Check token limit
-        if branch.token_count + token_count > self.MAX_TOKENS_PER_BRANCH:
+        if branch.token_count + token_usage > self.MAX_TOKENS_PER_BRANCH:
             raise ValueError(
                 f"Adding this content would exceed the token limit "
                 f"({self.MAX_TOKENS_PER_BRANCH}) for branch {branch_id}"
             )
             
         branch.content_items.append(item)
-        branch.token_count += token_count
+        branch.token_count += token_usage
         
         return item
     
@@ -450,14 +532,7 @@ class ResearchContext:
                    branch_id: str,
                    content_type: Optional[ContentType] = None) -> List[ContentItem]:
         """
-        Get content items from a specific branch.
-        
-        Args:
-            branch_id: Branch to get content from
-            content_type: Optional filter by content type
-            
-        Returns:
-            List of matching content items
+        Get content items from a specific branch, optionally filtered by ContentType.
         """
         if branch_id not in self.branches:
             raise ValueError(f"Branch {branch_id} not found")
@@ -472,22 +547,13 @@ class ResearchContext:
     def _estimate_tokens(self, content: str) -> int:
         """
         Estimate the number of tokens in a piece of content.
-        
-        Args:
-            content: Text content to analyze
-            
-        Returns:
-            Estimated token count
+        Simple approximation: ~4 characters per token.
         """
-        # Simple estimation: ~4 characters per token
         return len(content) // 4
     
     def to_dict(self) -> Dict[str, Any]:
         """
         Convert the context to a dictionary for serialization.
-        
-        Returns:
-            Dictionary representation of the context
         """
         return {
             "initial_question": self.initial_question,
@@ -521,12 +587,6 @@ class ResearchContext:
     def from_dict(cls, data: Dict[str, Any]) -> 'ResearchContext':
         """
         Create a context instance from a dictionary.
-        
-        Args:
-            data: Dictionary representation of a context
-            
-        Returns:
-            New ResearchContext instance
         """
         context = cls(data["initial_question"])
         context.version = data["version"]
@@ -565,20 +625,23 @@ class ResearchContext:
 
 ```python
 """
-Execution agent for generating code and structured output using Claude.
+Execution agent for generating code and structured output using Claude (claude-3-5-sonnet-20241022).
 Handles code generation, data formatting, and output validation.
 """
 
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
-import time
-from rich import print as rprint
-import anthropic
 import os
 import json
+import time
+import logging
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+from rich import print as rprint
+import anthropic
 
 from .base import BaseAgent, ResearchDecision, DecisionType
 from .context import ResearchContext, ContentType, ContentItem
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ExecutionTask:
@@ -590,6 +653,7 @@ class ExecutionTask:
         content: Content to process
         priority: Task priority (0-1)
         rationale: Why this task is needed
+        timestamp: When this task is created
     """
     task_type: str
     content: str
@@ -600,8 +664,7 @@ class ExecutionTask:
 class ExecutionAgent(BaseAgent):
     """
     Agent responsible for generating code and structured output using Claude.
-    
-    Handles code generation, data formatting, and output validation.
+    Uses the model 'claude-3-5-sonnet-20241022' by default for code or JSON output.
     """
     
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -614,7 +677,7 @@ class ExecutionAgent(BaseAgent):
         super().__init__("execute", config)
         
         # Initialize Claude client
-        self.claude_client = anthropic.Anthropic(
+        self.claude_client = anthropic.Client(
             api_key=os.getenv("ANTHROPIC_API_KEY")
         )
         
@@ -626,78 +689,62 @@ class ExecutionAgent(BaseAgent):
         # Tracking
         self.execution_tasks: Dict[str, ExecutionTask] = {}
         
+        logger.info("ExecutionAgent initialized with model=%s", self.model)
+        
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
         """
-        Analyze the research context and decide on execution tasks.
-        
-        Args:
-            context: Current research context
-            
-        Returns:
-            List of execution-related decisions
+        Scan the research context for content that might need code generation
+        or structured output, generating new EXECUTE decisions if needed.
         """
         decisions = []
         
-        # Get analyzed content that might need structured output
-        analyzed_content = context.get_content(
-            "main",
-            ContentType.ANALYSIS
-        )
+        # Example heuristic: If the ReasoningAgent's analysis mentions
+        # "Generate code" or "structured JSON," propose an EXECUTE decision.
+        analysis_content = context.get_content("main", ContentType.ANALYSIS)
         
-        for content in analyzed_content:
-            # Check if content needs code generation
-            if self._needs_code_generation(content):
+        for content_item in analysis_content:
+            text_lower = str(content_item.content).lower()
+            
+            # If the analysis suggests code
+            if "generate code" in text_lower or "implementation" in text_lower:
+                logger.info("Found code generation request in analysis")
                 decisions.append(
                     ResearchDecision(
                         decision_type=DecisionType.EXECUTE,
-                        priority=content.priority * 0.9,
+                        priority=content_item.priority,
                         context={
                             "task_type": "code",
-                            "content": content.content,
-                            "metadata": content.metadata
+                            "content": str(content_item.content),
+                            "metadata": content_item.metadata
                         },
-                        rationale="Generate code implementation"
+                        rationale="Generating code from analysis"
                     )
                 )
-                
-            # Check if content needs JSON formatting
-            if self._needs_json_formatting(content):
+            
+            # If the analysis suggests structured JSON
+            if "structured json" in text_lower or "format json" in text_lower:
+                logger.info("Found JSON formatting request in analysis")
                 decisions.append(
                     ResearchDecision(
                         decision_type=DecisionType.EXECUTE,
-                        priority=content.priority * 0.8,
+                        priority=content_item.priority,
                         context={
                             "task_type": "json",
-                            "content": content.content,
-                            "metadata": content.metadata
+                            "content": str(content_item.content),
+                            "metadata": content_item.metadata
                         },
-                        rationale="Convert analysis to structured JSON"
+                        rationale="Converting analysis to structured JSON"
                     )
                 )
-                
+        
         return decisions
         
     def can_handle(self, decision: ResearchDecision) -> bool:
-        """
-        Check if this agent can handle a decision.
-        
-        Args:
-            decision: Decision to evaluate
-            
-        Returns:
-            True if this agent can handle the decision
-        """
         return decision.decision_type == DecisionType.EXECUTE
         
     def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
         """
         Execute a code or structured output decision.
-        
-        Args:
-            decision: Execution decision to execute
-            
-        Returns:
-            Generated output and metadata
         """
         start_time = time.time()
         success = False
@@ -717,7 +764,9 @@ class ExecutionAgent(BaseAgent):
                 rationale=decision.rationale
             )
             
-            # Execute with retries
+            logger.info("Starting execution task_id=%s type=%s", task_id, task_type)
+            
+            # Attempt generation
             for attempt in range(self.max_retries + 1):
                 try:
                     if task_type == "code":
@@ -729,19 +778,22 @@ class ExecutionAgent(BaseAgent):
                         
                     success = True
                     break
-                    
                 except Exception as e:
+                    logger.error("Execution attempt %d failed for task_type=%s: %s", 
+                               attempt+1, task_type, e)
                     if attempt == self.max_retries:
                         raise
-                    rprint(f"[yellow]Attempt {attempt + 1} failed: {str(e)}[/yellow]")
-                    time.sleep(1)  # Brief delay before retry
+                    time.sleep(1)
                     
             if success:
-                rprint(f"[green]{task_type.title()} generation completed[/green]")
+                logger.info("Task %s completed successfully", task_id)
+                rprint(f"[green]ExecutionAgent: {task_type} generation succeeded[/green]")
             else:
-                rprint(f"[yellow]No output generated for {task_type}[/yellow]")
+                logger.warning("No output generated for task %s", task_id)
+                rprint(f"[yellow]ExecutionAgent: no output generated for {task_type}[/yellow]")
                 
         except Exception as e:
+            logger.exception("Execution error:")
             rprint(f"[red]Execution error: {str(e)}[/red]")
             results = {
                 "error": str(e),
@@ -753,164 +805,98 @@ class ExecutionAgent(BaseAgent):
             
         finally:
             execution_time = time.time() - start_time
+            logger.info("Task execution time: %.2f seconds", execution_time)
             self.log_decision(decision, success, execution_time)
             
         return results
         
-    def _needs_code_generation(self, content: ContentItem) -> bool:
+    def _generate_code(self, content: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Check if content needs code generation.
-        
-        Args:
-            content: Content item to check
-            
-        Returns:
-            True if code generation is needed
+        Generate code via Anthropic with a single 'prompt=' string
+        instead of 'messages' containing a 'system' role.
         """
-        # Look for code-related keywords
-        code_indicators = [
-            "implementation",
-            "code",
-            "function",
-            "class",
-            "algorithm",
-            "script"
-        ]
+        system_instructions = (
+            "You are an expert code generator. Generate clean, efficient, "
+            "and well-documented code based on the provided description.\n"
+        )
+        user_instructions = f"User request:\n{content}\n"
         
-        text = content.content.lower()
-        return any(indicator in text for indicator in code_indicators)
-        
-    def _needs_json_formatting(self, content: ContentItem) -> bool:
-        """
-        Check if content needs JSON formatting.
-        
-        Args:
-            content: Content item to check
-            
-        Returns:
-            True if JSON formatting is needed
-        """
-        # Look for structured data indicators
-        json_indicators = [
-            "structured",
-            "json",
-            "data format",
-            "schema",
-            "key-value",
-            "mapping"
-        ]
-        
-        text = content.content.lower()
-        return any(indicator in text for indicator in json_indicators)
-        
-    def _generate_code(
-        self,
-        content: str,
-        metadata: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """
-        Generate code using Claude.
-        
-        Args:
-            content: Content to generate code from
-            metadata: Additional context
-            
-        Returns:
-            Generated code and metadata
-        """
-        messages = [{
-            "role": "system",
-            "content": (
-                "You are an expert code generator. Generate clean, efficient, "
-                "and well-documented code based on the provided description."
-            )
-        }, {
-            "role": "user",
-            "content": f"Generate code for:\n\n{content}"
-        }]
-        
-        response = self.claude_client.messages.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=4000
+        # Use the Anthropic HUMAN_PROMPT and AI_PROMPT
+        # so that we do not pass 'role: system' in messages.
+        prompt_str = (
+            f"{anthropic.HUMAN_PROMPT} {system_instructions}\n{user_instructions}"
+            f"{anthropic.AI_PROMPT}"
         )
         
-        generated_code = response.content[0].text
+        logger.info("Generating code with Claude model=%s", self.model)
+        response = self.claude_client.completions.create(
+            model=self.model,
+            max_tokens_to_sample=4000,
+            temperature=0.7,
+            prompt=prompt_str
+        )
+        
+        generated_code = response.completion
+        language = self._detect_language(generated_code)
+        logger.info("Code generated successfully in language: %s", language)
         
         return {
             "output": generated_code,
-            "language": self._detect_language(generated_code),
+            "language": language,
             "metadata": metadata
         }
         
-    def _format_json(
-        self,
-        content: str,
-        metadata: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def _format_json(self, content: str, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Convert content to structured JSON using Claude.
-        
-        Args:
-            content: Content to convert to JSON
-            metadata: Additional context
-            
-        Returns:
-            Formatted JSON and metadata
+        Convert content into JSON format via Anthropic, again using
+        a single prompt string without 'role: system'.
         """
-        messages = [{
-            "role": "system",
-            "content": (
-                "You are an expert at converting unstructured text into clean, "
-                "well-structured JSON format."
-            )
-        }, {
-            "role": "user",
-            "content": f"Convert to JSON:\n\n{content}"
-        }]
+        system_instructions = (
+            "You are an expert at converting unstructured text into clean, "
+            "well-structured JSON format.\n"
+        )
+        user_instructions = f"Please convert the following to valid JSON:\n{content}\n"
         
-        response = self.claude_client.messages.create(
-            model=self.model,
-            messages=messages,
-            max_tokens=4000
+        prompt_str = (
+            f"{anthropic.HUMAN_PROMPT} {system_instructions}\n{user_instructions}"
+            f"{anthropic.AI_PROMPT}"
         )
         
-        json_str = response.content[0].text
+        logger.info("Formatting JSON with Claude model=%s", self.model)
+        response = self.claude_client.completions.create(
+            model=self.model,
+            max_tokens_to_sample=4000,
+            temperature=0.7,
+            prompt=prompt_str
+        )
         
-        # Validate JSON
+        json_str = response.completion.strip()
+        
         try:
             json_data = json.loads(json_str)
+            logger.info("JSON formatting successful")
             return {
                 "output": json_data,
                 "format": "json",
                 "metadata": metadata
             }
         except json.JSONDecodeError as e:
+            logger.error("Invalid JSON generated: %s", e)
             raise ValueError(f"Invalid JSON generated: {str(e)}")
             
     def _detect_language(self, code: str) -> str:
         """
         Detect the programming language of generated code.
-        
-        Args:
-            code: Generated code to analyze
-            
-        Returns:
-            Detected language name
         """
-        # TODO: Implement smarter language detection
-        # For now, use simple keyword matching
         language_indicators = {
             "python": ["def ", "import ", "class ", "print("],
             "javascript": ["function", "const ", "let ", "var "],
             "java": ["public class", "private ", "void ", "String"],
             "cpp": ["#include", "int main", "std::", "void"]
         }
-        
         for lang, indicators in language_indicators.items():
             if any(indicator in code for indicator in indicators):
                 return lang
-                
         return "unknown"
 ```
 
@@ -920,13 +906,16 @@ class ExecutionAgent(BaseAgent):
 """
 Explore agent for managing URL content extraction using Firecrawl.
 Handles webpage scraping, content cleaning, and metadata extraction.
+Supports parallel URL exploration with rate limiting and retries.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 import time
 from rich import print as rprint
 from urllib.parse import urlparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..firecrawl_client import FirecrawlClient
 from .base import BaseAgent, ResearchDecision, DecisionType
@@ -942,19 +931,23 @@ class ExplorationTarget:
         priority: Exploration priority (0-1)
         rationale: Why this URL was selected
         source_query_id: ID of the search query that found this URL
+        status: Current status of exploration
+        results: Exploration results if completed
     """
     url: str
     priority: float
     rationale: str
     source_query_id: Optional[str] = None
     timestamp: float = time.time()
+    status: str = "pending"  # pending, running, completed, failed
+    results: Optional[Dict[str, Any]] = None
 
 class ExploreAgent(BaseAgent):
     """
     Agent responsible for managing URL exploration using the Firecrawl API.
     
     Handles webpage scraping, content cleaning, and integration with the
-    research context.
+    research context. Supports parallel exploration with rate limiting.
     """
     
     def __init__(self, firecrawl_client: FirecrawlClient, config: Optional[Dict[str, Any]] = None):
@@ -968,65 +961,91 @@ class ExploreAgent(BaseAgent):
         super().__init__("explore", config)
         self.firecrawl = firecrawl_client
         self.explored_urls: Dict[str, ExplorationTarget] = {}
+        self._url_lock = threading.Lock()
         
         # Configuration
         self.max_urls = self.config.get("max_urls", 10)
         self.min_priority = self.config.get("min_priority", 0.3)
         self.allowed_domains = self.config.get("allowed_domains", [])
+        self.max_retries = self.config.get("max_retries", 3)
+        self.retry_delay = self.config.get("retry_delay", 1.0)  # seconds
+        self.max_parallel_domains = self.config.get("max_parallel_domains", 3)
+        
+        # Domain rate limiting
+        self._domain_requests: Dict[str, List[float]] = {}
+        self._domain_lock = threading.Lock()
         
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
         """
-        Analyze the research context and decide on URL exploration actions.
-        
-        Args:
-            context: Current research context
-            
-        Returns:
-            List of exploration-related decisions
+        Look at search results, generate decisions to explore unvisited URLs.
+        Groups URLs by domain for efficient parallel processing.
         """
         decisions = []
         
-        # Get search results to find URLs
-        search_results = context.get_content(
-            "main",
-            ContentType.SEARCH_RESULT
-        )
+        # Get search results with potential URLs
+        search_results = context.get_content("main", ContentType.SEARCH_RESULT)
         
         # Check if we've hit our URL limit
-        if len(self.explored_urls) >= self.max_urls:
-            rprint("[yellow]Explore agent: Maximum number of URLs reached[/yellow]")
-            return decisions
+        with self._url_lock:
+            if len(self.explored_urls) >= self.max_urls:
+                rprint("[yellow]ExploreAgent: Reached maximum URL limit[/yellow]")
+                return decisions
+        
+        # Group URLs by domain for parallel processing
+        domain_urls: Dict[str, List[Dict[str, Any]]] = {}
         
         # Process each search result
         for result in search_results:
+            if not isinstance(result.content, dict):
+                continue
+                
             urls = result.content.get("urls", [])
             query_id = result.content.get("query_id")
             
             for url in urls:
+                # Basic validation
                 if not self._is_valid_url(url):
                     continue
                     
-                # Skip if already explored
-                if url in self.explored_urls:
-                    continue
-                    
-                # Calculate priority based on result priority
-                priority = result.priority * 0.8  # Slight reduction from search priority
+                with self._url_lock:
+                    if url in self.explored_urls:
+                        continue
                 
+                # Group by domain
+                domain = urlparse(url).netloc.lower()
+                if domain not in domain_urls:
+                    domain_urls[domain] = []
+                
+                priority = result.priority * 0.8
                 if priority >= self.min_priority:
-                    decisions.append(
-                        ResearchDecision(
-                            decision_type=DecisionType.EXPLORE,
-                            priority=priority,
-                            context={
-                                "url": url,
-                                "source_query_id": query_id,
-                                "rationale": f"URL found in search results: {url}"
-                            },
-                            rationale=f"New URL discovered from search"
-                        )
+                    domain_urls[domain].append({
+                        "url": url,
+                        "priority": priority,
+                        "query_id": query_id,
+                        "rationale": f"URL found in search results: {url}"
+                    })
+        
+        # Create decisions for each domain's URLs
+        for domain, urls in domain_urls.items():
+            # Sort URLs by priority within each domain
+            urls.sort(key=lambda x: x["priority"], reverse=True)
+            
+            # Take top N URLs per domain based on priority
+            for url_info in urls[:self.max_parallel_domains]:
+                decisions.append(
+                    ResearchDecision(
+                        decision_type=DecisionType.EXPLORE,
+                        priority=url_info["priority"],
+                        context={
+                            "url": url_info["url"],
+                            "source_query_id": url_info["query_id"],
+                            "rationale": url_info["rationale"],
+                            "domain": domain
+                        },
+                        rationale=f"Parallel exploration of domain {domain}"
                     )
-                    
+                )
+        
         return decisions
         
     def can_handle(self, decision: ResearchDecision) -> bool:
@@ -1043,13 +1062,7 @@ class ExploreAgent(BaseAgent):
         
     def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
         """
-        Execute a URL exploration decision.
-        
-        Args:
-            decision: Exploration decision to execute
-            
-        Returns:
-            Extracted content and metadata
+        Execute a URL exploration decision with retries and rate limiting.
         """
         start_time = time.time()
         success = False
@@ -1057,39 +1070,88 @@ class ExploreAgent(BaseAgent):
         
         try:
             url = decision.context["url"]
+            domain = decision.context["domain"]
             
-            # Extract content
-            results = self.firecrawl.extract_content(url)
+            # Check domain rate limits
+            if not self._check_domain_rate_limit(domain):
+                rprint(f"[yellow]ExploreAgent: Rate limit hit for domain {domain}[/yellow]")
+                time.sleep(1.0)  # Basic backoff
             
-            # Track the exploration
-            self.explored_urls[url] = ExplorationTarget(
-                url=url,
-                priority=decision.priority,
-                rationale=decision.context["rationale"],
-                source_query_id=decision.context.get("source_query_id"),
-                timestamp=time.time()
-            )
+            # Execute with retries
+            for attempt in range(self.max_retries):
+                try:
+                    results = self.firecrawl.extract_content(url)
+                    break
+                except Exception as e:
+                    if attempt < self.max_retries - 1:
+                        rprint(f"[yellow]ExploreAgent: Retry {attempt + 1} for {url}: {e}[/yellow]")
+                        time.sleep(self.retry_delay)
+                    else:
+                        raise
+            
+            # Track exploration with thread safety
+            with self._url_lock:
+                self.explored_urls[url] = ExplorationTarget(
+                    url=url,
+                    priority=decision.priority,
+                    rationale=decision.context["rationale"],
+                    source_query_id=decision.context.get("source_query_id"),
+                    status="completed",
+                    results=results
+                )
             
             success = bool(results.get("text"))
             if success:
-                rprint(f"[green]Content extracted: {url}[/green]")
+                rprint(f"[green]ExploreAgent: Content extracted from {url}[/green]")
             else:
-                rprint(f"[yellow]No content extracted from: {url}[/yellow]")
+                rprint(f"[yellow]ExploreAgent: No content extracted from {url}[/yellow]")
                 
         except Exception as e:
-            rprint(f"[red]Exploration error: {str(e)}[/red]")
+            rprint(f"[red]ExploreAgent error: {str(e)}[/red]")
             results = {
                 "error": str(e),
                 "text": "",
-                "metadata": {"url": url}
+                "metadata": {"url": decision.context.get("url", "")}
             }
+            
+            # Log failed exploration
+            with self._url_lock:
+                self.explored_urls[url] = ExplorationTarget(
+                    url=url,
+                    priority=decision.priority,
+                    rationale=decision.context["rationale"],
+                    source_query_id=decision.context.get("source_query_id"),
+                    status="failed",
+                    results=results
+                )
             
         finally:
             execution_time = time.time() - start_time
             self.log_decision(decision, success, execution_time)
             
         return results
-        
+    
+    def _check_domain_rate_limit(self, domain: str) -> bool:
+        """Check if we can make another request to this domain."""
+        with self._domain_lock:
+            now = time.time()
+            if domain not in self._domain_requests:
+                self._domain_requests[domain] = []
+            
+            # Remove old timestamps
+            self._domain_requests[domain] = [
+                ts for ts in self._domain_requests[domain]
+                if now - ts < 60  # Keep last minute
+            ]
+            
+            # Check rate limit (max 10 requests per minute per domain)
+            if len(self._domain_requests[domain]) >= 10:
+                return False
+            
+            # Add new timestamp
+            self._domain_requests[domain].append(now)
+            return True
+    
     def _is_valid_url(self, url: str) -> bool:
         """
         Validate a URL for exploration.
@@ -1117,14 +1179,28 @@ class ExploreAgent(BaseAgent):
             
         except Exception:
             return False
+    
+    def get_exploration_status(self, url: str) -> Optional[Dict[str, Any]]:
+        """Get the current status and results of a URL exploration."""
+        with self._url_lock:
+            target = self.explored_urls.get(url)
+            if target:
+                return {
+                    "url": target.url,
+                    "status": target.status,
+                    "results": target.results,
+                    "timestamp": target.timestamp
+                }
+        return None
 ```
 
 ## rat/research/agents/reason.py
 
 ```python
 """
-Reasoning agent for analyzing research content using DeepSeek.
-Handles content analysis, parallel processing, and insight generation.
+Reasoning agent for analyzing research content using DeepSeek (deepseek-reasoner).
+Now it also acts as the "lead agent" that decides next steps (search, explore, etc.).
+Supports parallel processing of content analysis and decision making.
 """
 
 from typing import List, Dict, Any, Optional
@@ -1134,21 +1210,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich import print as rprint
 from openai import OpenAI
 import os
+import json
+import logging
 
 from .base import BaseAgent, ResearchDecision, DecisionType
 from .context import ResearchContext, ContentType, ContentItem
 
+logger = logging.getLogger(__name__)
+
 @dataclass
 class AnalysisTask:
-    """
-    Represents a content analysis task.
-    
-    Attributes:
-        content: Content to analyze
-        priority: Analysis priority (0-1)
-        rationale: Why this analysis is needed
-        chunk_index: Index if this is part of a chunked analysis
-    """
     content: str
     priority: float
     rationale: str
@@ -1157,335 +1228,442 @@ class AnalysisTask:
 
 class ReasoningAgent(BaseAgent):
     """
-    Agent responsible for analyzing content using the DeepSeek API.
-    
-    Handles content analysis, parallel processing for large contexts,
-    and insight generation.
+    Agent responsible for analyzing content using the DeepSeek API (deepseek-reasoner).
+    Splits content if it exceeds 64k tokens, calls the API, merges results, etc.
+    Also drives the research forward (search, explore, or terminate).
     """
-    
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the reasoning agent.
-        
-        Args:
-            config: Optional configuration parameters
-        """
         super().__init__("reason", config)
         
-        # Initialize DeepSeek client
         self.deepseek_client = OpenAI(
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             base_url="https://api.deepseek.com"
         )
         
-        # Configuration
         self.max_parallel_tasks = self.config.get("max_parallel_tasks", 3)
-        self.chunk_size = self.config.get("chunk_size", 30000)  # ~30k tokens per chunk
+        self.max_tokens_per_call = 64000
+        self.max_output_tokens = 8192
+        self.request_timeout = self.config.get("deepseek_timeout", 180)
+        
         self.min_priority = self.config.get("min_priority", 0.3)
-        
-        # Tracking
         self.analysis_tasks: Dict[str, AnalysisTask] = {}
-        
+
+        logger.info(
+            "ReasoningAgent initialized with max_parallel_tasks=%d, max_tokens_per_call=%d, max_output_tokens=%d",
+            self.max_parallel_tasks,
+            self.max_tokens_per_call,
+            self.max_output_tokens
+        )
+
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
-        """
-        Analyze the research context and decide on reasoning tasks.
-        
-        Args:
-            context: Current research context
-            
-        Returns:
-            List of reasoning-related decisions
-        """
         decisions = []
+        search_results = context.get_content("main", ContentType.SEARCH_RESULT)
+        if not search_results:
+            initial_queries = self._generate_initial_queries(context.initial_question)
+            for query_info in initial_queries:
+                decisions.append(
+                    ResearchDecision(
+                        decision_type=DecisionType.SEARCH,
+                        priority=1.0,
+                        context={
+                            "query": query_info["query"],
+                            "rationale": query_info["rationale"]
+                        },
+                        rationale=f"Parallel initial search: {query_info['rationale']}"
+                    )
+                )
+            return decisions
         
-        # Get content needing analysis
-        search_results = context.get_content(
-            "main",
-            ContentType.SEARCH_RESULT
-        )
-        explored_content = context.get_content(
-            "main",
-            ContentType.URL_CONTENT
-        )
+        unprocessed_search = [
+            item for item in search_results
+            if not item.metadata.get("analyzed_by_reasoner")
+        ]
+        explored_content = context.get_content("main", ContentType.EXPLORED_CONTENT)
+        unprocessed_explored = [
+            item for item in explored_content
+            if not item.metadata.get("analyzed_by_reasoner")
+        ]
         
-        # Analyze search results
-        if search_results:
-            decisions.extend(
-                self._create_analysis_decisions(
-                    content_items=search_results,
-                    content_type="search_results",
-                    base_priority=0.9
+        for item in unprocessed_search + unprocessed_explored:
+            if item.priority < self.min_priority:
+                continue
+            content_str = str(item.content)
+            tokens_estimated = len(content_str) // 4
+            if tokens_estimated > self.max_tokens_per_call:
+                chunks = self._split_content_into_chunks(content_str)
+                for idx, chunk in enumerate(chunks):
+                    decisions.append(
+                        ResearchDecision(
+                            decision_type=DecisionType.REASON,
+                            priority=0.9,
+                            context={
+                                "content": chunk,
+                                "content_type": item.content_type.value,
+                                "item_id": item.id,
+                                "chunk_info": {
+                                    "index": idx,
+                                    "total_chunks": len(chunks)
+                                }
+                            },
+                            rationale=f"Analyze chunk {idx+1}/{len(chunks)} of {item.content_type.value} content"
+                        )
+                    )
+            else:
+                decisions.append(
+                    ResearchDecision(
+                        decision_type=DecisionType.REASON,
+                        priority=0.9,
+                        context={
+                            "content": content_str,
+                            "content_type": item.content_type.value,
+                            "item_id": item.id
+                        },
+                        rationale=f"Analyze new {item.content_type.value} content"
+                    )
+                )
+        
+        analysis_items = context.get_content("main", ContentType.ANALYSIS)
+        analysis_by_source = {}
+        for aitem in analysis_items:
+            sid = aitem.metadata.get("source_content_id")
+            if sid:
+                analysis_by_source.setdefault(sid, []).append(aitem)
+        
+        gaps = self._parallel_identify_gaps(context.initial_question, analysis_by_source, context)
+        for gap in gaps:
+            if gap["type"] == "search":
+                decisions.append(
+                    ResearchDecision(
+                        decision_type=DecisionType.SEARCH,
+                        priority=0.8,
+                        context={
+                            "query": gap["query"],
+                            "rationale": gap["rationale"]
+                        },
+                        rationale=f"Fill knowledge gap: {gap['rationale']}"
+                    )
+                )
+            elif gap["type"] == "explore":
+                decisions.append(
+                    ResearchDecision(
+                        decision_type=DecisionType.EXPLORE,
+                        priority=0.75,
+                        context={
+                            "url": gap["url"],
+                            "rationale": gap["rationale"]
+                        },
+                        rationale=f"Explore URL for more details: {gap['rationale']}"
+                    )
+                )
+        
+        if self._should_terminate(context):
+            decisions.append(
+                ResearchDecision(
+                    decision_type=DecisionType.TERMINATE,
+                    priority=1.0,
+                    context={},
+                    rationale="Research question appears sufficiently answered"
                 )
             )
-            
-        # Analyze explored content
-        if explored_content:
-            decisions.extend(
-                self._create_analysis_decisions(
-                    content_items=explored_content,
-                    content_type="url_content",
-                    base_priority=0.8
-                )
-            )
-            
+        
         return decisions
-        
+    
     def can_handle(self, decision: ResearchDecision) -> bool:
-        """
-        Check if this agent can handle a decision.
-        
-        Args:
-            decision: Decision to evaluate
-            
-        Returns:
-            True if this agent can handle the decision
-        """
         return decision.decision_type == DecisionType.REASON
-        
+    
     def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
-        """
-        Execute a reasoning decision.
-        
-        Args:
-            decision: Reasoning decision to execute
-            
-        Returns:
-            Analysis results and insights
-        """
         start_time = time.time()
         success = False
         results = {}
-        
         try:
             content = decision.context["content"]
             content_type = decision.context["content_type"]
+            item_id = decision.context["item_id"]
             
-            # Check if content needs chunking
-            if len(content.split()) > self.chunk_size:
-                results = self._parallel_analyze_content(content, content_type)
-            else:
-                results = self._analyze_content_chunk(content, content_type)
-                
+            tokens_estimated = len(content) // 4
+            if tokens_estimated > self.max_tokens_per_call:
+                msg = f"Chunk is still too large: {tokens_estimated} tokens > {self.max_tokens_per_call}"
+                logger.warning(msg)
+                raise ValueError(msg)
+            
+            single_result = self._analyze_content_chunk(content, content_type)
+            results = single_result
             success = bool(results.get("analysis"))
-            if success:
-                rprint(f"[green]Analysis completed for {content_type}[/green]")
-            else:
-                rprint(f"[yellow]No analysis generated for {content_type}[/yellow]")
-                
-        except Exception as e:
-            rprint(f"[red]Analysis error: {str(e)}[/red]")
-            results = {
-                "error": str(e),
-                "analysis": "",
-                "insights": []
-            }
+            decision.context["analyzed_by_reasoner"] = True
+            results["analyzed_item_id"] = item_id
             
+            if success:
+                rprint(f"[green]ReasoningAgent: Analysis completed for content type '{content_type}'[/green]")
+            else:
+                rprint(f"[yellow]ReasoningAgent: No analysis produced for '{content_type}'[/yellow]")
+        except Exception as e:
+            rprint(f"[red]ReasoningAgent error: {str(e)}[/red]")
+            results = {"error": str(e), "analysis": "", "insights": []}
         finally:
             execution_time = time.time() - start_time
             self.log_decision(decision, success, execution_time)
-            
+            logger.info("Reasoning decision executed. Success=%s, time=%.2fsec", success, execution_time)
         return results
-        
-    def _create_analysis_decisions(
-        self,
-        content_items: List[ContentItem],
-        content_type: str,
-        base_priority: float
-    ) -> List[ResearchDecision]:
-        """
-        Create analysis decisions for content items.
-        
-        Args:
-            content_items: Content items to analyze
-            content_type: Type of content being analyzed
-            base_priority: Base priority for these items
-            
-        Returns:
-            List of analysis decisions
-        """
-        decisions = []
-        
-        for item in content_items:
-            # Skip if priority too low
-            if item.priority * base_priority < self.min_priority:
-                continue
-                
-            decisions.append(
-                ResearchDecision(
-                    decision_type=DecisionType.REASON,
-                    priority=item.priority * base_priority,
-                    context={
-                        "content": item.content,
-                        "content_type": content_type,
-                        "metadata": item.metadata
-                    },
-                    rationale=f"Analyze {content_type} content"
-                )
-            )
-            
-        return decisions
-        
-    def _parallel_analyze_content(
-        self,
-        content: str,
-        content_type: str
-    ) -> Dict[str, Any]:
-        """
-        Analyze large content in parallel chunks.
-        
-        Args:
-            content: Content to analyze
-            content_type: Type of content being analyzed
-            
-        Returns:
-            Combined analysis results
-        """
-        # Split content into chunks
-        words = content.split()
-        chunks = []
-        current_chunk = []
-        
-        for word in words:
-            current_chunk.append(word)
-            if len(current_chunk) >= self.chunk_size:
-                chunks.append(" ".join(current_chunk))
-                current_chunk = []
-                
-        if current_chunk:
-            chunks.append(" ".join(current_chunk))
-            
-        # Analyze chunks in parallel
-        chunk_results = []
-        with ThreadPoolExecutor(max_workers=self.max_parallel_tasks) as executor:
-            future_to_chunk = {
-                executor.submit(
-                    self._analyze_content_chunk,
-                    chunk,
-                    f"{content_type}_chunk_{i}"
-                ): i
-                for i, chunk in enumerate(chunks)
-            }
-            
-            for future in as_completed(future_to_chunk):
-                chunk_index = future_to_chunk[future]
-                try:
-                    result = future.result()
-                    result["chunk_index"] = chunk_index
-                    chunk_results.append(result)
-                except Exception as e:
-                    rprint(f"[red]Error in chunk {chunk_index}: {str(e)}[/red]")
-                    
-        # Combine chunk results
-        return self._combine_chunk_results(chunk_results)
-        
-    def _analyze_content_chunk(
-        self,
-        content: str,
-        content_type: str
-    ) -> Dict[str, Any]:
-        """
-        Analyze a single chunk of content using DeepSeek.
-        
-        Args:
-            content: Content chunk to analyze
-            content_type: Type of content being analyzed
-            
-        Returns:
-            Analysis results for this chunk
-        """
+    
+    def _analyze_content_chunk(self, content: str, content_type: str) -> Dict[str, Any]:
         try:
+            logger.debug(
+                "Sending chunk (length=%d chars) to DeepSeek with max_tokens=%d",
+                len(content), self.max_output_tokens
+            )
             response = self.deepseek_client.chat.completions.create(
                 model="deepseek-reasoner",
-                messages=[{
-                    "role": "system",
-                    "content": (
-                        "You are an expert research analyst. Analyze the following "
-                        "content and extract key insights, patterns, and implications."
-                    )
-                }, {
-                    "role": "user",
-                    "content": f"Content type: {content_type}\n\nContent:\n{content}"
-                }],
-                temperature=0.7
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an advanced deepseek-reasoner model. "
+                            "Analyze the content for key insights, patterns, or relevant facts. "
+                            "You can elaborate on major findings."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Content type: {content_type}\n\nContent:\n{content}"
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=self.max_output_tokens,
+                stream=False
             )
-            
             analysis = response.choices[0].message.content
-            
             return {
                 "analysis": analysis,
                 "insights": self._extract_insights(analysis),
                 "content_type": content_type
             }
-            
         except Exception as e:
             rprint(f"[red]DeepSeek API error: {str(e)}[/red]")
+            logger.exception("Error calling DeepSeek for chunk analysis.")
             return {
                 "analysis": "",
                 "insights": [],
                 "content_type": content_type,
                 "error": str(e)
             }
-            
-    def _combine_chunk_results(
-        self,
-        chunk_results: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """
-        Combine results from multiple analyzed chunks.
-        
-        Args:
-            chunk_results: List of chunk analysis results
-            
-        Returns:
-            Combined analysis
-        """
-        # Sort chunks by index
-        sorted_chunks = sorted(chunk_results, key=lambda x: x.get("chunk_index", 0))
-        
-        # Combine analyses
-        combined_analysis = "\n\n".join(
-            chunk["analysis"] for chunk in sorted_chunks
-            if chunk.get("analysis")
-        )
-        
-        # Merge insights
-        all_insights = []
-        for chunk in sorted_chunks:
-            all_insights.extend(chunk.get("insights", []))
-            
-        # Remove duplicates while preserving order
-        unique_insights = list(dict.fromkeys(all_insights))
-        
-        return {
-            "analysis": combined_analysis,
-            "insights": unique_insights,
-            "chunk_count": len(chunk_results)
-        }
-        
+    
     def _extract_insights(self, analysis: str) -> List[str]:
-        """
-        Extract key insights from an analysis.
-        
-        Args:
-            analysis: Analysis text to process
-            
-        Returns:
-            List of extracted insights
-        """
-        # TODO: Use more sophisticated insight extraction
-        # For now, split on newlines and filter
         lines = analysis.split("\n")
         insights = []
-        
         for line in lines:
             line = line.strip()
-            # Look for bullet points or numbered items
-            if line.startswith(("-", "*", "•")) or (
-                len(line) > 2 and line[0].isdigit() and line[1] == "."
+            if (
+                line.startswith("-") or line.startswith("*") or
+                line.startswith("•") or (line[:2].isdigit() and line[2] in [".", ")"])
             ):
-                insights.append(line.lstrip("- *•").strip())
-                
+                insights.append(line.lstrip("-*•").strip())
         return insights
+    
+    def _split_content_into_chunks(self, content: str) -> List[str]:
+        words = content.split()
+        safe_limit = self.max_tokens_per_call - 1000
+        chunk_size_words = safe_limit * 4
+        chunks = []
+        idx = 0
+        while idx < len(words):
+            chunk = words[idx : idx + chunk_size_words]
+            chunks.append(" ".join(chunk))
+            idx += chunk_size_words
+        return chunks
+    
+    def _generate_initial_queries(self, question: str) -> List[Dict[str, Any]]:
+        try:
+            sanitized_question = self._sanitize_and_shorten_question(question)
+            logger.debug("Sending sanitized question to DeepSeek: %s", sanitized_question)
+            try:
+                response = self.deepseek_client.chat.completions.create(
+                    model="deepseek-reasoner",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Generate exactly 3 to 5 different search queries in valid JSON format. "
+                                "Each item in the JSON array must be an object with 'query' and 'rationale' keys. "
+                                "No text outside the JSON array."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": sanitized_question
+                        }
+                    ],
+                    temperature=0.7,
+                    max_tokens=self.max_output_tokens
+                )
+            except Exception as api_error:
+                logger.error("DeepSeek API call failed: %s", str(api_error))
+                return [{
+                    "query": question,
+                    "rationale": f"Direct fallback search - API error: {str(api_error)}"
+                }]
+            content_str = response.choices[0].message.content.strip()
+            logger.debug("DeepSeek API response content: %s", content_str)
+            if not content_str:
+                logger.error("Empty response from DeepSeek API")
+                return [{
+                    "query": question,
+                    "rationale": "Direct fallback search - empty API response"
+                }]
+            
+            # Strip markdown code block delimiters if present
+            if content_str.startswith("```"):
+                content_str = content_str.split("\n", 1)[1]  # Remove first line with ```json
+            if content_str.endswith("```"):
+                content_str = content_str.rsplit("\n", 1)[0]  # Remove last line with ```
+            content_str = content_str.strip()
+            
+            queries = json.loads(content_str)
+            if not isinstance(queries, list):
+                raise ValueError("Expected a JSON list.")
+            for q in queries:
+                if not isinstance(q, dict) or "query" not in q or "rationale" not in q:
+                    raise ValueError("Must have query + rationale.")
+            return queries
+        except Exception as e:
+            rprint(f"[red]Error generating initial queries: {e}[/red]")
+            logger.exception("Error in _generate_initial_queries.")
+            return [{
+                "query": question,
+                "rationale": "Direct fallback search"
+            }]
+
+    def _sanitize_and_shorten_question(self, question: str, max_tokens: int = 300) -> str:
+        sanitized = " ".join(question.split())
+        words = sanitized.split()
+        if len(words) > max_tokens:
+            words = words[:max_tokens]
+            sanitized = " ".join(words)
+        return sanitized
+    
+    def _parallel_identify_gaps(self, question: str,
+                                analysis_by_source: Dict[str, List[ContentItem]],
+                                context: ResearchContext) -> List[Dict[str, Any]]:
+        try:
+            tasks = []
+            for source_id, items in analysis_by_source.items():
+                combined_analysis = " ".join(str(item.content) for item in items)
+                tasks.append({
+                    "question": question,
+                    "analysis": combined_analysis,
+                    "source_id": source_id
+                })
+            with ThreadPoolExecutor(max_workers=self.max_parallel_tasks) as executor:
+                futures = []
+                for task in tasks:
+                    fut = executor.submit(
+                        self._analyze_single_source_gaps,
+                        task["question"],
+                        task["analysis"],
+                        task["source_id"]
+                    )
+                    futures.append(fut)
+                all_gaps = []
+                for future in as_completed(futures):
+                    try:
+                        gaps = future.result()
+                        all_gaps.extend(gaps)
+                    except Exception as e:
+                        rprint(f"[red]Error in gap analysis: {e}[/red]")
+                        logger.exception("Error analyzing knowledge gaps.")
+            return self._deduplicate_gaps(all_gaps)
+        except Exception as e:
+            rprint(f"[red]Error in parallel gap identification: {e}[/red]")
+            logger.exception("Error in _parallel_identify_gaps.")
+            return []
+    
+    def _analyze_single_source_gaps(self, question: str, analysis: str, source_id: str) -> List[Dict[str, Any]]:
+        try:
+            response = self.deepseek_client.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Identify knowledge gaps in the current analysis. Output valid JSON array. "
+                            "Each item must have: 'type' (search|explore), 'query' or 'url', 'rationale'. "
+                            "No text outside the JSON array."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Question: {question}\n\nCurrent Analysis:\n{analysis}"
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=self.max_output_tokens,
+                stream=False
+            )
+            content_str = response.choices[0].message.content.strip()
+            gaps = json.loads(content_str)
+            if not isinstance(gaps, list):
+                raise ValueError("Expected JSON list.")
+            for gap in gaps:
+                if gap["type"] not in ["search", "explore"]:
+                    raise ValueError("type must be search or explore.")
+                if gap["type"] == "search" and "query" not in gap:
+                    raise ValueError("search item missing query.")
+                if gap["type"] == "explore" and "url" not in gap:
+                    raise ValueError("explore item missing url.")
+                if "rationale" not in gap:
+                    raise ValueError("gap missing rationale.")
+                gap["source_id"] = source_id
+            return gaps
+        except Exception as e:
+            rprint(f"[red]Error analyzing source gaps: {e}[/red]")
+            logger.exception("Error analyzing source gaps for source_id=%s", source_id)
+            return []
+
+    def _deduplicate_gaps(self, gaps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        unique_gaps = {}
+        for gap in gaps:
+            key = gap["query"] if gap["type"] == "search" else gap["url"]
+            if key not in unique_gaps:
+                unique_gaps[key] = gap
+            else:
+                if len(gap["rationale"]) > len(unique_gaps[key]["rationale"]):
+                    unique_gaps[key] = gap
+        return list(unique_gaps.values())
+    
+    def _should_terminate(self, context: ResearchContext) -> bool:
+        analysis_items = context.get_content("main", ContentType.ANALYSIS)
+        if not analysis_items:
+            return False
+        combined_analysis = " ".join(str(a.content) for a in analysis_items)
+        try:
+            response = self.deepseek_client.chat.completions.create(
+                model="deepseek-reasoner",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a research completion analyst. Evaluate if we have enough info. "
+                            "Return JSON with {complete: bool, confidence: 0..1, missing: []}."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Question: {context.initial_question}\n\nFindings:\n{combined_analysis}"
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=self.max_output_tokens,
+                stream=False
+            )
+            try:
+                result = json.loads(response.choices[0].message.content)
+                return result.get("complete", False) and (result.get("confidence", 0) >= 0.8)
+            except Exception:
+                return False
+        except Exception as e:
+            rprint(f"[red]Error checking termination: {e}[/red]")
+            logger.exception("Error in _should_terminate check.")
+            return False
 ```
 
 ## rat/research/agents/search.py
@@ -1494,13 +1672,14 @@ class ReasoningAgent(BaseAgent):
 """
 Search agent for managing Perplexity-based research queries.
 Handles query refinement, result tracking, and search history management.
+Supports parallel search execution with rate limiting.
 """
 
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
-import json
 import time
 from rich import print as rprint
+import threading
 
 from ..perplexity_client import PerplexityClient
 from .base import BaseAgent, ResearchDecision, DecisionType
@@ -1508,257 +1687,150 @@ from .context import ResearchContext, ContentType, ContentItem
 
 @dataclass
 class SearchQuery:
-    """
-    Represents a search query and its context.
-    
-    Attributes:
-        query: The search query text
-        priority: Query priority (0-1)
-        rationale: Why this query was generated
-        parent_query_id: ID of the query that led to this one
-        timestamp: When the query was created
-    """
     query: str
     priority: float
     rationale: str
     parent_query_id: Optional[str] = None
     timestamp: float = time.time()
+    status: str = "pending"
+    results: Optional[Dict[str, Any]] = None
 
 class SearchAgent(BaseAgent):
     """
     Agent responsible for managing search operations using the Perplexity API.
-    
-    Handles query refinement, result tracking, and integration with the
-    research context.
+    Supports parallel search execution with rate limiting.
     """
-    
     def __init__(self, perplexity_client: PerplexityClient, config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the search agent.
-        
-        Args:
-            perplexity_client: Client for Perplexity API interactions
-            config: Optional configuration parameters
-        """
         super().__init__("search", config)
         self.perplexity = perplexity_client
         self.query_history: Dict[str, SearchQuery] = {}
+        self._query_lock = threading.Lock()
         
-        # Configuration
         self.max_queries = self.config.get("max_queries", 5)
         self.min_priority = self.config.get("min_priority", 0.3)
-        self.refinement_threshold = self.config.get("refinement_threshold", 0.7)
-        
+        self.max_retries = self.config.get("max_retries", 3)
+        self.retry_delay = self.config.get("retry_delay", 1.0)
+    
     def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
-        """
-        Analyze the research context and decide on search actions.
-        
-        Args:
-            context: Current research context
-            
-        Returns:
-            List of search-related decisions
-        """
         decisions = []
-        
-        # Get existing search content
-        search_results = context.get_content(
-            "main",
-            ContentType.SEARCH_RESULT
-        )
-        
-        # Check if we've hit our query limit
-        if len(self.query_history) >= self.max_queries:
-            rprint("[yellow]Search agent: Maximum number of queries reached[/yellow]")
-            return decisions
-        
-        # Initial search if no results yet
-        if not search_results:
-            decisions.append(
-                ResearchDecision(
-                    decision_type=DecisionType.SEARCH,
-                    priority=1.0,
-                    context={
-                        "query": context.initial_question,
-                        "rationale": "Initial search to begin research"
-                    },
-                    rationale="No existing search results found"
-                )
-            )
-            return decisions
-            
-        # Analyze existing results for gaps
-        knowledge_gaps = self._identify_knowledge_gaps(context)
-        
-        # Generate refined queries
-        for gap in knowledge_gaps:
-            if gap.get("priority", 0) < self.min_priority:
-                continue
-                
-            query = self._generate_refined_query(gap, context)
-            if query:
+        search_results = context.get_content("main", ContentType.SEARCH_RESULT)
+        if not search_results and len(self.query_history) == 0:
+            initial_queries = self._generate_query_variations(context.initial_question)
+            for query_info in initial_queries:
                 decisions.append(
                     ResearchDecision(
                         decision_type=DecisionType.SEARCH,
-                        priority=gap.get("priority", 0.5),
+                        priority=1.0,
                         context={
-                            "query": query.query,
-                            "rationale": query.rationale,
-                            "parent_query_id": query.parent_query_id
+                            "query": query_info["query"],
+                            "rationale": query_info["rationale"],
+                            "variation_type": query_info["type"]
                         },
-                        rationale=f"Addressing knowledge gap: {gap['description']}"
+                        rationale=f"Parallel initial search: {query_info['rationale']}"
                     )
                 )
-                
         return decisions
-        
+    
     def can_handle(self, decision: ResearchDecision) -> bool:
-        """
-        Check if this agent can handle a decision.
-        
-        Args:
-            decision: Decision to evaluate
-            
-        Returns:
-            True if this agent can handle the decision
-        """
         return decision.decision_type == DecisionType.SEARCH
-        
+    
     def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
-        """
-        Execute a search decision.
-        
-        Args:
-            decision: Search decision to execute
-            
-        Returns:
-            Search results and metadata
-        """
         start_time = time.time()
         success = False
         results = {}
-        
         try:
             query = decision.context["query"]
-            
-            # Execute search
-            results = self.perplexity.search(query)
-            
-            # Track the query
-            query_id = str(len(self.query_history) + 1)
-            self.query_history[query_id] = SearchQuery(
-                query=query,
-                priority=decision.priority,
-                rationale=decision.context["rationale"],
-                parent_query_id=decision.context.get("parent_query_id"),
-                timestamp=time.time()
-            )
-            
-            results.update({
-                "query_id": query_id,
-                "urls": results.get("urls", [])
-            })
-            
+            if decision.priority < self.min_priority:
+                rprint(f"[yellow]SearchAgent: Priority too low for query '{query}'[/yellow]")
+                results = {"content": "", "urls": []}
+            else:
+                for attempt in range(self.max_retries):
+                    try:
+                        results = self.perplexity.search(query)
+                        break
+                    except Exception as e:
+                        if attempt < self.max_retries - 1:
+                            rprint(f"[yellow]SearchAgent: Retry {attempt + 1} for query '{query}': {e}[/yellow]")
+                            time.sleep(self.retry_delay)
+                        else:
+                            raise
+                with self._query_lock:
+                    query_id = str(len(self.query_history) + 1)
+                    self.query_history[query_id] = SearchQuery(
+                        query=query,
+                        priority=decision.priority,
+                        rationale=decision.context.get("rationale", ""),
+                        parent_query_id=decision.context.get("parent_query_id"),
+                        status="completed",
+                        results=results
+                    )
+                    results["query_id"] = query_id
             success = True
-            rprint(f"[green]Search completed: {query}[/green]")
-            
+            rprint(f"[green]SearchAgent: Search completed for query: '{query}'[/green]")
         except Exception as e:
-            rprint(f"[red]Search error: {str(e)}[/red]")
-            results = {
-                "error": str(e),
-                "urls": []
-            }
-            
+            rprint(f"[red]SearchAgent error: {str(e)}[/red]")
+            results = {"error": str(e), "urls": []}
+            with self._query_lock:
+                query_id = str(len(self.query_history) + 1)
+                self.query_history[query_id] = SearchQuery(
+                    query=query,
+                    priority=decision.priority,
+                    rationale=decision.context.get("rationale", ""),
+                    parent_query_id=decision.context.get("parent_query_id"),
+                    status="failed",
+                    results=results
+                )
         finally:
-            execution_time = time.time() - start_time
-            self.log_decision(decision, success, execution_time)
-            
+            exec_time = time.time() - start_time
+            self.log_decision(decision, success, exec_time)
         return results
-        
-    def _identify_knowledge_gaps(self, context: ResearchContext) -> List[Dict[str, Any]]:
-        """
-        Analyze current context to identify knowledge gaps.
-        
-        Args:
-            context: Current research context
-            
-        Returns:
-            List of identified knowledge gaps
-        """
-        # Get all content for analysis
-        all_content = context.get_content("main")
-        search_results = context.get_content("main", ContentType.SEARCH_RESULT)
-        
-        # Basic gap identification
-        gaps = []
-        
-        # If we have initial search results, generate follow-up queries
-        if search_results:
-            # Follow-up on Billit details
-            if not any("stakeholders" in str(content.content).lower() for content in search_results):
-                gaps.append({
-                    "description": "Find key stakeholders and management team at Billit",
-                    "priority": 0.9
-                })
-                
-            # Follow-up on competitors
-            if not any("market share" in str(content.content).lower() for content in search_results):
-                gaps.append({
-                    "description": "Research market share and competitive positioning of accounting software in Belgium",
-                    "priority": 0.8
-                })
-                
-            # Follow-up on pricing details
-            if not any("pricing comparison" in str(content.content).lower() for content in search_results):
-                gaps.append({
-                    "description": "Compare detailed pricing and features of Belgian accounting software platforms",
-                    "priority": 0.7
-                })
-        else:
-            # Initial search if no results yet
-            gaps.append({
-                "description": "Need initial research on Billit and Belgian accounting software",
-                "priority": 1.0
-            })
-            
-        return gaps
-        
-    def _generate_refined_query(
-        self,
-        gap: Dict[str, Any],
-        context: ResearchContext
-    ) -> Optional[SearchQuery]:
-        """
-        Generate a refined search query to address a knowledge gap.
-        
-        Args:
-            gap: Identified knowledge gap
-            context: Current research context
-            
-        Returns:
-            Generated search query or None if no refinement needed
-        """
-        existing_queries = set(q.query for q in self.query_history.values())
-        
-        # Generate specific queries based on the gap description
-        query = None
-        if "stakeholders" in gap["description"].lower():
-            query = "Who are the key executives, management team, and stakeholders at Billit Belgium? List their roles and backgrounds."
-        elif "market share" in gap["description"].lower():
-            query = "What is the market share and competitive positioning of accounting software companies in Belgium? Compare Billit with its main competitors."
-        elif "pricing comparison" in gap["description"].lower():
-            query = "Compare the detailed pricing, features, and plans of major accounting and e-invoicing software platforms in Belgium including Billit."
-        else:
-            # Fallback to basic refinement
-            query = f"{context.initial_question} {gap['description']}"
-        
-        if query and query not in existing_queries:
-            return SearchQuery(
-                query=query,
-                priority=gap["priority"],
-                rationale=f"Addressing gap: {gap['description']}"
-            )
-            
+    
+    def _generate_query_variations(self, question: str) -> List[Dict[str, Any]]:
+        sanitized_question = " ".join(question.split())
+        variations = [
+            {
+                "query": sanitized_question,
+                "rationale": "Direct search using original question",
+                "type": "original"
+            }
+        ]
+        if "vs" in sanitized_question.lower() or "compare" in sanitized_question.lower():
+            parts = sanitized_question.lower().split(" vs ")
+            if len(parts) == 2:
+                variations.extend([
+                    {
+                        "query": f"detailed information about {parts[0].strip()}",
+                        "rationale": f"Focus on first comparison target: {parts[0].strip()}",
+                        "type": "comparison_first"
+                    },
+                    {
+                        "query": f"detailed information about {parts[1].strip()}",
+                        "rationale": f"Focus on second comparison target: {parts[1].strip()}",
+                        "type": "comparison_second"
+                    }
+                ])
+        variations.append({
+            "query": f"specific details technical features {sanitized_question}",
+            "rationale": "Focus on technical details and features",
+            "type": "technical"
+        })
+        variations.append({
+            "query": f"overview market context competitors {sanitized_question}",
+            "rationale": "Focus on market context and competition",
+            "type": "market"
+        })
+        return variations
+    
+    def get_query_status(self, query_id: str) -> Optional[Dict[str, Any]]:
+        with self._query_lock:
+            q = self.query_history.get(query_id)
+            if q:
+                return {
+                    "query": q.query,
+                    "status": q.status,
+                    "results": q.results,
+                    "timestamp": q.timestamp
+                }
         return None
 ```
 
@@ -1772,20 +1844,33 @@ from web pages and processing the extracted data.
 """
 
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 from rich import print as rprint
 from firecrawl import FirecrawlApp
+import logging
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 class FirecrawlClient:
-    def __init__(self):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.api_key = os.getenv("FIRECRAWL_API_KEY")
         if not self.api_key:
             raise ValueError("FIRECRAWL_API_KEY not found in environment variables")
         
+        # Configuration
+        self.config = config or {}
+        self.request_timeout = self.config.get("request_timeout", 60)  # 60s default
+        
+        # Initialize client (timeout will be used in requests)
         self.app = FirecrawlApp(api_key=self.api_key)
+        
+        logger.info(
+            "FirecrawlClient initialized with timeout=%d",
+            self.request_timeout
+        )
         
     def extract_content(self, url: str) -> Dict[str, Any]:
         """
@@ -1802,11 +1887,14 @@ class FirecrawlClient:
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
             
-            # Make the request to scrape the URL
+            logger.info("Extracting content from URL: %s", url)
+            
+            # Make the request to scrape the URL with timeout
             result = self.app.scrape_url(
                 url,
                 params={
                     'formats': ['markdown'],
+                    'request_timeout': self.request_timeout  # Pass timeout in params
                 }
             )
             
@@ -1814,6 +1902,7 @@ class FirecrawlClient:
             
         except Exception as e:
             rprint(f"[red]Firecrawl API request failed for {url}: {str(e)}[/red]")
+            logger.exception("Error extracting content from URL: %s", url)
             return {
                 "title": "",
                 "text": "",
@@ -1898,6 +1987,7 @@ Provides a command-line interface for conducting research using specialized agen
 import os
 import sys
 import json
+import logging
 from pathlib import Path
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
@@ -1912,6 +2002,24 @@ from .orchestrator import ResearchOrchestrator
 from .output_manager import OutputManager
 
 console = Console()
+
+def setup_logging():
+    """
+    Configure logging so that logs are overwritten on each run.
+    """
+    log_path = "rat.log"
+    # Remove the log file if it exists, so we overwrite on every new run
+    if os.path.exists(log_path):
+        os.remove(log_path)
+
+    logging.basicConfig(
+        filename=log_path,
+        filemode="w",  # Overwrite mode
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+    
+    logging.info("Logger initialized. All logs will be written to rat.log and overwritten each run.")
 
 def load_config() -> Dict[str, Any]:
     """Load configuration from environment variables."""
@@ -1988,14 +2096,21 @@ def run_research(question: str, config: Dict[str, Any]) -> None:
     results = orchestrator.start_research(question)
     
     if "error" in results:
+        logger.error("Research error: %s", results['error'])
         console.print(f"[red]Research error: {results['error']}[/red]")
     else:
+        logger.info("Research completed successfully")
         console.print(Panel(Markdown(results["paper"]), title="Research Results", border_style="green"))
 
 def main():
     """Main entry point for the research system."""
     import argparse
     
+    # Setup logging once at startup
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    logger.info("Starting RAT main program...")
+
     parser = argparse.ArgumentParser(description="RAT - Retrieval Augmented Thinking")
     parser.add_argument("--interactive", "-i", action="store_true", 
                        help="Start in interactive mode")
@@ -2008,6 +2123,7 @@ def main():
     if args.interactive:
         display_welcome()
         commands = WordCompleter(['research', 'config', 'metrics', 'help', 'exit'])
+        
         orchestrator: Optional[ResearchOrchestrator] = None
         
         while True:
@@ -2018,6 +2134,7 @@ def main():
                     continue
                     
                 if user_input.lower() == 'exit':
+                    logger.info("User exited the interactive session")
                     console.print("[yellow]Exiting research system...[/yellow]")
                     break
                     
@@ -2026,10 +2143,12 @@ def main():
                     continue
                     
                 if user_input.lower() == 'config':
+                    logger.info("Displaying configuration")
                     console.print(Panel(json.dumps(config, indent=2), title="Configuration", border_style="cyan"))
                     continue
                     
                 if user_input.lower() == 'metrics' and orchestrator:
+                    logger.info("Calculating research metrics")
                     metrics = orchestrator._calculate_metrics(time.time())
                     console.print(Panel(json.dumps(metrics, indent=2), title="Research Metrics", border_style="magenta"))
                     continue
@@ -2037,24 +2156,29 @@ def main():
                 if user_input.lower().startswith('research '):
                     question = user_input[9:].strip()
                     if not question:
+                        logger.warning("Empty research question provided")
                         console.print("[red]Please provide a research question.[/red]")
                         continue
-                    
+                    logger.info("Starting research with question: %s", question)
                     run_research(question, config)
                     continue
                     
+                logger.warning("Unknown command received: %s", user_input)
                 console.print("[red]Unknown command. Type 'help' for available commands.[/red]")
                 
             except KeyboardInterrupt:
+                logger.info("Operation cancelled by user")
                 console.print("\n[yellow]Operation cancelled. Type 'exit' to quit.[/yellow]")
                 continue
                 
             except Exception as e:
+                logger.exception("Exception occurred in interactive loop")
                 console.print(f"[red]Error: {str(e)}[/red]")
                 continue
     else:
         if not args.question:
             parser.error("Research question is required when not in interactive mode")
+        logger.info("Starting non-interactive research with question: %s", args.question)
         run_research(args.question, config)
 
 if __name__ == '__main__':
@@ -2067,36 +2191,30 @@ if __name__ == '__main__':
 """
 Orchestrator for coordinating the multi-agent research workflow.
 Manages agent interactions, research flow, and data persistence.
+Supports parallel execution of decisions by type.
 """
 
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import json
 import time
+import logging
 from rich import print as rprint
 from pathlib import Path
 
 from .agents.search import SearchAgent
 from .agents.explore import ExploreAgent
 from .agents.reason import ReasoningAgent
-from .agents.execute import ExecutionAgent
 from .perplexity_client import PerplexityClient
 from .firecrawl_client import FirecrawlClient
 from .output_manager import OutputManager
 from .agents.base import ResearchDecision, DecisionType
 from .agents.context import ResearchContext, ContentType, ContentItem
 
+logger = logging.getLogger(__name__)
+
 @dataclass
 class ResearchIteration:
-    """
-    Represents a single iteration of the research process.
-    
-    Attributes:
-        iteration_number: Current iteration number
-        decisions_made: List of decisions made
-        content_added: New content items added
-        metrics: Performance metrics for this iteration
-    """
     iteration_number: int
     decisions_made: List[ResearchDecision]
     content_added: List[ContentItem]
@@ -2106,101 +2224,86 @@ class ResearchIteration:
 class ResearchOrchestrator:
     """
     Coordinates the multi-agent research workflow.
-    
-    Manages agent interactions, research flow, and ensures all components
-    work together effectively.
+    Manages agent interactions, research flow, parallel decisions, etc.
     """
-    
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the research orchestrator.
-        
-        Args:
-            config: Optional configuration parameters
-        """
         self.config = config or {}
-        
-        # Initialize clients
         self.perplexity = PerplexityClient()
         self.firecrawl = FirecrawlClient()
         
-        # Initialize agents
         self.search_agent = SearchAgent(
             self.perplexity,
-            self.config.get("search_config")
+            {
+                **(self.config.get("search_config") or {}),
+                "max_workers": self.config.get("max_parallel_searches", 10),
+                "rate_limit": self.config.get("search_rate_limit", 100)
+            }
         )
         self.explore_agent = ExploreAgent(
             self.firecrawl,
-            self.config.get("explore_config")
+            {
+                **(self.config.get("explore_config") or {}),
+                "max_workers": self.config.get("max_parallel_explores", 10),
+                "rate_limit": self.config.get("explore_rate_limit", 100)
+            }
         )
         self.reason_agent = ReasoningAgent(
-            self.config.get("reason_config")
-        )
-        self.execute_agent = ExecutionAgent(
-            self.config.get("execute_config")
+            {
+                **(self.config.get("reason_config") or {}),
+                "max_workers": self.config.get("max_parallel_reason", 5),
+                "rate_limit": self.config.get("reason_rate_limit", 50)
+            }
         )
         
-        # Initialize managers
         self.output_manager = OutputManager()
         
-        # Configuration
         self.max_iterations = self.config.get("max_iterations", 5)
-        self.min_new_content = self.config.get("min_new_content", 1)  # Lower threshold since we're getting good content
+        self.min_new_content = self.config.get("min_new_content", 1)
         self.min_confidence = self.config.get("min_confidence", 0.7)
         
-        # State tracking
         self.current_context: Optional[ResearchContext] = None
         self.iterations: List[ResearchIteration] = []
         self.research_dir: Optional[Path] = None
-        
+
     def start_research(self, question: str) -> Dict[str, Any]:
-        """
-        Start a new research process.
-        
-        Args:
-            question: Research question to investigate
-            
-        Returns:
-            Research results and metrics
-        """
         start_time = time.time()
-        
         try:
-            # Create research directory
-            self.research_dir = self.output_manager.create_research_dir(question)
+            question = " ".join(question.split())
+            if not question:
+                raise ValueError("Research question cannot be empty")
+            rprint(f"\n[bold]Starting research on: {question}[/bold]\n")
+            logger.info("Starting research on question='%s'", question)
             
-            # Initialize research context
+            self.research_dir = self.output_manager.create_research_dir(question)
             self.current_context = ResearchContext(initial_question=question)
             
-            # Main research loop
             iteration = 0
             while iteration < self.max_iterations:
                 iteration += 1
                 rprint(f"\n[bold cyan]Starting iteration {iteration}[/bold cyan]")
-                
-                # Run one iteration
-                iteration_result = self._run_iteration(iteration)
-                self.iterations.append(iteration_result)
-                
-                # Check if we should continue
-                if self._should_terminate(iteration_result):
+                logger.info("Beginning iteration %d of max %d", iteration, self.max_iterations)
+                try:
+                    iteration_result = self._run_iteration(iteration)
+                    self.iterations.append(iteration_result)
+                    if self._should_terminate(iteration_result):
+                        break
+                except Exception as e:
+                    rprint(f"[red]Error in iteration {iteration}: {str(e)}[/red]")
+                    logger.exception("Exception in iteration %d", iteration)
+                    if iteration == 1:
+                        raise
                     break
-                    
-            # Generate final output
             results = self._generate_final_output()
-            
-            # Save results
             if self.research_dir:
                 self.output_manager.save_research_paper(self.research_dir, results)
-            
-            # Calculate overall metrics
             total_time = time.time() - start_time
             results["metrics"] = self._calculate_metrics(total_time)
-            
+            logger.info("Research completed successfully in %.2f seconds.", total_time)
             return results
-            
         except Exception as e:
             rprint(f"[red]Research error: {str(e)}[/red]")
+            logger.exception("Error during the research process.")
             return {
                 "error": str(e),
                 "paper": "Error occurred during research",
@@ -2209,228 +2312,187 @@ class ResearchOrchestrator:
                     "total_time": time.time() - start_time
                 }
             }
-            
+
     def _run_iteration(self, iteration_number: int) -> ResearchIteration:
-        """
-        Run one iteration of the research process.
-        
-        Args:
-            iteration_number: Current iteration number
-            
-        Returns:
-            Results of this iteration
-        """
         iteration_start = time.time()
-        decisions_made = []
+        all_decisions = []
         content_added = []
-        
+        logger.debug("Running iteration %d", iteration_number)
         try:
-            # 1. Get decisions from all agents
-            all_decisions = self._gather_agent_decisions()
+            reason_decisions = self.reason_agent.analyze(self.current_context)
+            if any(d.decision_type == DecisionType.TERMINATE for d in reason_decisions):
+                all_decisions.extend(reason_decisions)
+                logger.debug("Terminate decision found in reason_decisions, skipping other agents.")
+            else:
+                search_decisions = self.search_agent.analyze(self.current_context)
+                explore_decisions = self.explore_agent.analyze(self.current_context)
+                
+                all_decisions = reason_decisions + search_decisions + explore_decisions
             
-            # 2. Sort decisions by priority
-            sorted_decisions = sorted(
-                all_decisions,
-                key=lambda d: d.priority,
-                reverse=True
-            )
+            decisions_by_type = {
+                DecisionType.SEARCH: [],
+                DecisionType.EXPLORE: [],
+                DecisionType.REASON: []
+            }
+            for d in all_decisions:
+                if d.decision_type != DecisionType.TERMINATE:
+                    decisions_by_type[d.decision_type].append(d)
             
-            # 3. Execute decisions
-            for decision in sorted_decisions:
-                agent = self._get_agent_for_decision(decision)
-                if agent:
-                    try:
-                        result = agent.execute_decision(decision)
-                        decisions_made.append(decision)
-                        
-                        # Add results to context
-                        if result:
-                            # Process result based on decision type
-                            if decision.decision_type == DecisionType.SEARCH:
-                                # For search results, extract content and urls
-                                content_str = result.get('content', '')
-                                urls = result.get('urls', [])
-                                token_count = self.current_context._estimate_tokens(content_str)
-                                
-                                content_item = ContentItem(
-                                    content_type=self._get_content_type(decision),
-                                    content=content_str,
-                                    metadata={
-                                        "decision_type": decision.decision_type.value,
-                                        "iteration": iteration_number,
-                                        "urls": urls
-                                    },
-                                    token_count=token_count,
-                                    priority=decision.priority
-                                )
-                            else:
-                                # For other types, handle as before
-                                content_str = result if isinstance(result, str) else json.dumps(result)
-                                token_count = self.current_context._estimate_tokens(content_str)
-                                
-                                content_item = ContentItem(
-                                    content_type=self._get_content_type(decision),
-                                    content=result,
-                                    metadata={
-                                        "decision_type": decision.decision_type.value,
-                                        "iteration": iteration_number
-                                    },
-                                    token_count=token_count,
-                                    priority=decision.priority
-                                )
-                            self.current_context.add_content("main", content_item=content_item)
-                            content_added.append(content_item)
-                            
-                    except Exception as e:
-                        rprint(f"[red]Error executing decision: {str(e)}[/red]")
-                        
+            # Phase 1: Parallel Search
+            if decisions_by_type[DecisionType.SEARCH]:
+                logger.debug("Executing %d SEARCH decisions in parallel.", len(decisions_by_type[DecisionType.SEARCH]))
+                search_results = self.search_agent.execute_parallel(decisions_by_type[DecisionType.SEARCH])
+                for d, res in zip(decisions_by_type[DecisionType.SEARCH], search_results):
+                    if res and "error" not in res:
+                        item = self._create_content_item(d, res, iteration_number)
+                        self.current_context.add_content("main", content_item=item)
+                        content_added.append(item)
+            
+            # Phase 2: Parallel Explore
+            if decisions_by_type[DecisionType.EXPLORE]:
+                logger.debug("Executing %d EXPLORE decisions in parallel.", len(decisions_by_type[DecisionType.EXPLORE]))
+                explore_results = self.explore_agent.execute_parallel(decisions_by_type[DecisionType.EXPLORE])
+                for d, res in zip(decisions_by_type[DecisionType.EXPLORE], explore_results):
+                    if res and "error" not in res:
+                        item = self._create_content_item(d, res, iteration_number)
+                        self.current_context.add_content("main", content_item=item)
+                        content_added.append(item)
+            
+            # Phase 3: Parallel Reason
+            if decisions_by_type[DecisionType.REASON]:
+                logger.debug("Executing %d REASON decisions in parallel.", len(decisions_by_type[DecisionType.REASON]))
+                reason_results = self.reason_agent.execute_parallel(decisions_by_type[DecisionType.REASON])
+                for d, res in zip(decisions_by_type[DecisionType.REASON], reason_results):
+                    if res and "error" not in res:
+                        item = self._create_content_item(d, res, iteration_number)
+                        self.current_context.add_content("main", content_item=item)
+                        content_added.append(item)
+            
+            # Handle any TERMINATE decisions
+            terminate_decisions = [d for d in all_decisions if d.decision_type == DecisionType.TERMINATE]
+            if terminate_decisions:
+                logger.debug("Handling %d TERMINATE decisions.", len(terminate_decisions))
+                for d in terminate_decisions:
+                    # The reason agent can handle the actual finalize if needed:
+                    result = self.reason_agent.execute_decision(d)
+                    if result:
+                        item = self._create_content_item(d, result, iteration_number)
+                        self.current_context.add_content("main", content_item=item)
+                        content_added.append(item)
+        
         except Exception as e:
             rprint(f"[red]Iteration error: {str(e)}[/red]")
-            
-        # Calculate iteration metrics
+            logger.exception("Error in iteration %d", iteration_number)
+        
         metrics = {
             "iteration_time": time.time() - iteration_start,
-            "decisions_made": len(decisions_made),
+            "decisions_made": len(all_decisions),
             "content_added": len(content_added),
+            "parallel_metrics": {
+                "search_tasks": len(decisions_by_type[DecisionType.SEARCH]),
+                "explore_tasks": len(decisions_by_type[DecisionType.EXPLORE]),
+                "reason_tasks": len(decisions_by_type[DecisionType.REASON]),
+            },
             "agent_metrics": self._get_agent_metrics()
         }
-        
-        return ResearchIteration(
-            iteration_number=iteration_number,
-            decisions_made=decisions_made,
-            content_added=content_added,
-            metrics=metrics
+        logger.info(
+            "Iteration %d complete. Decisions made=%d, Content added=%d, Duration=%.2fsec",
+            iteration_number,
+            len(all_decisions),
+            len(content_added),
+            metrics["iteration_time"]
         )
-        
-    def _gather_agent_decisions(self) -> List[ResearchDecision]:
-        """
-        Gather decisions from all agents.
-        
-        Returns:
-            Combined list of decisions
-        """
-        all_decisions = []
-        
-        # Get decisions from each agent
-        for agent in [
-            self.search_agent,
-            self.explore_agent,
-            self.reason_agent,
-            self.execute_agent
-        ]:
-            try:
-                decisions = agent.analyze(self.current_context)
-                all_decisions.extend(decisions)
-            except Exception as e:
-                rprint(f"[red]Error getting decisions from {agent.name}: {str(e)}[/red]")
-                
-        return all_decisions
-        
-    def _get_agent_for_decision(
-        self,
-        decision: ResearchDecision
-    ) -> Optional[Any]:
-        """
-        Get the appropriate agent for a decision.
-        
-        Args:
-            decision: Decision to handle
-            
-        Returns:
-            Agent that can handle the decision
-        """
-        agent_map = {
-            DecisionType.SEARCH: self.search_agent,
-            DecisionType.EXPLORE: self.explore_agent,
-            DecisionType.REASON: self.reason_agent,
-            DecisionType.EXECUTE: self.execute_agent
-        }
-        
-        return agent_map.get(decision.decision_type)
-        
-    def _get_content_type(self, decision: ResearchDecision) -> ContentType:
-        """
-        Map decision type to content type.
-        
-        Args:
-            decision: Decision to map
-            
-        Returns:
-            Appropriate content type
-        """
-        type_map = {
-            DecisionType.SEARCH: ContentType.SEARCH_RESULT,
-            DecisionType.EXPLORE: ContentType.EXPLORED_CONTENT,
-            DecisionType.REASON: ContentType.ANALYSIS,
-            DecisionType.EXECUTE: ContentType.STRUCTURED_OUTPUT
-        }
-        
-        return type_map.get(decision.decision_type, ContentType.OTHER)
-        
+        return ResearchIteration(iteration_number, all_decisions, content_added, metrics)
+
+    def _create_content_item(self, decision: ResearchDecision,
+                             result: Dict[str, Any], iteration_number: int) -> ContentItem:
+        if decision.decision_type == DecisionType.SEARCH:
+            content_str = result.get('content', '')
+            urls = result.get('urls', [])
+            token_count = self.current_context._estimate_tokens(content_str)
+            return ContentItem(
+                content_type=ContentType.SEARCH_RESULT,
+                content=content_str,
+                metadata={
+                    "decision_type": decision.decision_type.value,
+                    "iteration": iteration_number,
+                    "urls": urls
+                },
+                token_count=token_count,
+                priority=decision.priority
+            )
+        elif decision.decision_type == DecisionType.EXPLORE:
+            content_str = json.dumps(result)
+            token_count = self.current_context._estimate_tokens(content_str)
+            return ContentItem(
+                content_type=ContentType.EXPLORED_CONTENT,
+                content=result,
+                metadata={
+                    "decision_type": decision.decision_type.value,
+                    "iteration": iteration_number
+                },
+                token_count=token_count,
+                priority=decision.priority
+            )
+        elif decision.decision_type == DecisionType.REASON:
+            content_str = json.dumps(result)
+            token_count = self.current_context._estimate_tokens(content_str)
+            return ContentItem(
+                content_type=ContentType.ANALYSIS,
+                content=result,
+                metadata={
+                    "decision_type": decision.decision_type.value,
+                    "iteration": iteration_number
+                },
+                token_count=token_count,
+                priority=decision.priority
+            )
+        else:
+            # TERMINATE or any fallback
+            content_str = json.dumps(result)
+            token_count = self.current_context._estimate_tokens(content_str)
+            return ContentItem(
+                content_type=ContentType.OTHER,
+                content=result,
+                metadata={
+                    "decision_type": decision.decision_type.value,
+                    "iteration": iteration_number
+                },
+                token_count=token_count,
+                priority=decision.priority
+            )
+
     def _should_terminate(self, iteration: ResearchIteration) -> bool:
-        """
-        Check if research should terminate.
-        
-        Args:
-            iteration: Last completed iteration
-            
-        Returns:
-            True if research should stop
-        """
-        # Check if we found enough content
-        if len(iteration.content_added) < self.min_new_content:
-            rprint("[yellow]Terminating: Not enough new content found[/yellow]")
+        logger.debug(
+            "Checking if we should terminate at iteration %d. content_added=%d, min_new_content=%d",
+            iteration.iteration_number, len(iteration.content_added), self.min_new_content
+        )
+        # If there's a TERMINATE decision
+        terminate_decision = any(d.decision_type == DecisionType.TERMINATE for d in iteration.decisions_made)
+        if terminate_decision:
+            logger.info("Terminating because ReasoningAgent gave a TERMINATE decision at iteration %d", iteration.iteration_number)
+            rprint("[green]Terminating: ReasoningAgent indicated completion.[/green]")
             return True
-            
-        # Check if we have high confidence results
-        analysis_content = self.current_context.get_content(
-            "main",
-            ContentType.ANALYSIS
-        )
-        if analysis_content:
-            latest = analysis_content[-1]
-            confidence = latest.content.get("confidence", 0)
-            if confidence >= self.min_confidence:
-                rprint("[green]Terminating: Reached confidence threshold[/green]")
-                return True
-                
+        # If we got no new content
+        if len(iteration.content_added) < self.min_new_content:
+            logger.info(
+                "Terminating because iteration %d had only %d new items, below min_new_content=%d",
+                iteration.iteration_number, len(iteration.content_added), self.min_new_content
+            )
+            rprint("[yellow]Terminating: No further new content was added.[/yellow]")
+            return True
         return False
-        
+    
     def _generate_final_output(self) -> Dict[str, Any]:
-        """
-        Generate the final research output.
+        search_results = self.current_context.get_content("main", ContentType.SEARCH_RESULT)
+        explored_content = self.current_context.get_content("main", ContentType.EXPLORED_CONTENT)
+        analysis = self.current_context.get_content("main", ContentType.ANALYSIS)
         
-        Returns:
-            Research paper and metadata
-        """
-        # Get all content by type
-        search_results = self.current_context.get_content(
-            "main",
-            ContentType.SEARCH_RESULT
-        )
-        explored_content = self.current_context.get_content(
-            "main",
-            ContentType.EXPLORED_CONTENT
-        )
-        analysis = self.current_context.get_content(
-            "main",
-            ContentType.ANALYSIS
-        )
-        structured_output = self.current_context.get_content(
-            "main",
-            ContentType.STRUCTURED_OUTPUT
-        )
-        
-        # Generate paper sections
         sections = []
-        
-        # Introduction
         sections.append(f"# {self.current_context.initial_question}\n")
         sections.append("## Introduction\n")
         if search_results:
             sections.append(search_results[0].content)
-            
-        # Main findings
         sections.append("\n## Key Findings\n")
         for result in analysis:
             if isinstance(result.content, dict):
@@ -2439,8 +2501,6 @@ class ResearchOrchestrator:
                     sections.append(f"- {insight}\n")
             else:
                 sections.append(f"- {result.content}\n")
-                
-        # Detailed analysis
         sections.append("\n## Detailed Analysis\n")
         for content in explored_content:
             if isinstance(content.content, dict):
@@ -2450,65 +2510,29 @@ class ResearchOrchestrator:
                     sections.append(f"\n### {title}\n\n{text}\n")
             else:
                 sections.append(f"\n{content.content}\n")
-                
-        # Technical details
-        if structured_output:
-            sections.append("\n## Technical Details\n")
-            for output in structured_output:
-                if isinstance(output.content, dict):
-                    if output.content.get("format") == "json":
-                        sections.append("```json\n")
-                        sections.append(
-                            json.dumps(output.content["output"], indent=2)
-                        )
-                        sections.append("\n```\n")
-                    else:
-                        sections.append("```\n")
-                        sections.append(output.content.get("output", ""))
-                        sections.append("\n```\n")
-                else:
-                    sections.append(f"{output.content}\n")
-                    
-        # Sources
         sections.append("\n## Sources\n")
         sources = set()
-        for content in explored_content:
-            url = content.content.get("metadata", {}).get("url")
+        for c in explored_content:
+            url = c.content.get("metadata", {}).get("url")
             if url:
                 sources.add(url)
-                
         for url in sorted(sources):
             sections.append(f"- {url}\n")
-            
+        
         return {
             "paper": "\n".join(sections),
             "title": self.current_context.initial_question,
             "sources": list(sources)
         }
-        
+    
     def _calculate_metrics(self, total_time: float) -> Dict[str, Any]:
-        """
-        Calculate overall research metrics.
-        
-        Args:
-            total_time: Total research time
-            
-        Returns:
-            Dictionary of metrics
-        """
         metrics = {
             "total_time": total_time,
             "iterations": len(self.iterations),
-            "total_decisions": sum(
-                len(it.decisions_made) for it in self.iterations
-            ),
-            "total_content": sum(
-                len(it.content_added) for it in self.iterations
-            ),
+            "total_decisions": sum(len(it.decisions_made) for it in self.iterations),
+            "total_content": sum(len(it.content_added) for it in self.iterations),
             "agent_metrics": self._get_agent_metrics()
         }
-        
-        # Add per-iteration metrics
         metrics["iterations_data"] = [
             {
                 "number": it.iteration_number,
@@ -2518,21 +2542,13 @@ class ResearchOrchestrator:
             }
             for it in self.iterations
         ]
-        
         return metrics
-        
+    
     def _get_agent_metrics(self) -> Dict[str, Any]:
-        """
-        Get metrics from all agents.
-        
-        Returns:
-            Combined agent metrics
-        """
         return {
             "search": self.search_agent.get_metrics(),
             "explore": self.explore_agent.get_metrics(),
-            "reason": self.reason_agent.get_metrics(),
-            "execute": self.execute_agent.get_metrics()
+            "reason": self.reason_agent.get_metrics()
         }
 ```
 
@@ -2552,60 +2568,24 @@ from typing import Dict, Any, List
 import shutil
 
 class OutputManager:
-    """
-    Manages research outputs and metrics.
-    
-    Handles:
-    - Creating research directories
-    - Saving research papers
-    - Tracking intermediate results
-    - Recording performance metrics
-    """
-    
     def __init__(self):
-        """Initialize the output manager."""
         self.base_dir = Path("research_outputs")
-        
+    
     def create_research_dir(self, question: str) -> Path:
-        """
-        Create a directory for research outputs.
-        
-        Args:
-            question: Research question
-            
-        Returns:
-            Path to created directory
-        """
-        # Create timestamped directory name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         dir_name = f"{timestamp}_{self._sanitize_filename(question[:50])}"
-        
-        # Create directory
         research_dir = self.base_dir / dir_name
         research_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save initial metadata
         self.save_metadata(research_dir, {
             "question": question,
             "started_at": timestamp,
             "status": "in_progress"
         })
-        
         return research_dir
-        
+    
     def save_research_paper(self, research_dir: Path, paper: Dict[str, Any]):
-        """
-        Save the research paper and update metadata.
-        
-        Args:
-            research_dir: Research output directory
-            paper: Paper content and metadata
-        """
-        # Save paper content
         paper_path = research_dir / "research_paper.md"
         paper_path.write_text(paper["paper"])
-        
-        # Save paper info
         info_path = research_dir / "research_info.json"
         info = {
             "title": paper["title"],
@@ -2613,136 +2593,67 @@ class OutputManager:
             "metrics": paper.get("metrics", {})
         }
         info_path.write_text(json.dumps(info, indent=2))
-        
-        # Update metadata
         self.save_metadata(research_dir, {
             "status": "completed",
             "completed_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
             "metrics": paper.get("metrics", {})
         })
-        
+    
     def save_context_state(self, research_dir: Path, context_data: Dict[str, Any]):
-        """
-        Save intermediate context state.
-        
-        Args:
-            research_dir: Research output directory
-            context_data: Context state to save
-        """
-        # Create states directory
         states_dir = research_dir / "states"
         states_dir.mkdir(exist_ok=True)
-        
-        # Save state with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         state_path = states_dir / f"context_state_{timestamp}.json"
         state_path.write_text(json.dumps(context_data, indent=2))
-        
-        # Keep only last 5 states to save space
         self._cleanup_old_states(states_dir)
-        
-    def save_iteration_metrics(
-        self,
-        research_dir: Path,
-        iterations: List[Dict[str, Any]]
-    ):
-        """
-        Save iteration performance metrics.
-        
-        Args:
-            research_dir: Research output directory
-            iterations: List of iteration metrics
-        """
+    
+    def save_iteration_metrics(self, research_dir: Path, iterations: List[Dict[str, Any]]):
         metrics_path = research_dir / "iteration_metrics.json"
         metrics_path.write_text(json.dumps({
             "iterations": iterations,
             "summary": self._calculate_metrics_summary(iterations)
         }, indent=2))
-        
+    
     def save_metadata(self, research_dir: Path, updates: Dict[str, Any]):
-        """
-        Update research session metadata.
-        
-        Args:
-            research_dir: Research output directory
-            updates: Metadata updates
-        """
         metadata_path = research_dir / "metadata.json"
-        
-        # Load existing metadata
         if metadata_path.exists():
             current_metadata = json.loads(metadata_path.read_text())
         else:
             current_metadata = {}
-            
-        # Update metadata
         current_metadata.update(updates)
-        
-        # Save updated metadata
         metadata_path.write_text(json.dumps(current_metadata, indent=2))
-        
+    
     def _sanitize_filename(self, name: str) -> str:
-        """
-        Create a safe filename from text.
-        
-        Args:
-            name: Text to convert to filename
-            
-        Returns:
-            Safe filename
-        """
-        # Replace unsafe characters
         safe_chars = "-_"
         filename = "".join(
             c if c.isalnum() or c in safe_chars else "_"
             for c in name
         )
         return filename.strip("_")
-        
+    
     def _cleanup_old_states(self, states_dir: Path):
-        """
-        Keep only the most recent state files.
-        
-        Args:
-            states_dir: Directory containing state files
-        """
         state_files = sorted(
             states_dir.glob("context_state_*.json"),
             key=lambda p: p.stat().st_mtime,
             reverse=True
         )
-        
-        # Remove old files
-        for file in state_files[5:]:  # Keep 5 most recent
+        for file in state_files[5:]:
             file.unlink()
-            
-    def _calculate_metrics_summary(
-        self,
-        iterations: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """
-        Calculate summary metrics across iterations.
-        
-        Args:
-            iterations: List of iteration metrics
-            
-        Returns:
-            Summary metrics
-        """
+    
+    def _calculate_metrics_summary(self, iterations: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not iterations:
             return {}
-            
         return {
             "total_iterations": len(iterations),
             "total_decisions": sum(it["decisions"] for it in iterations),
-            "total_new_content": sum(it["new_content"] for it in iterations),
+            "total_new_content": sum(it["new_content"] for it in iterations) if "new_content" in iterations[0] else 0,
             "total_time": sum(it["time"] for it in iterations),
             "avg_decisions_per_iteration": (
                 sum(it["decisions"] for it in iterations) / len(iterations)
             ),
             "avg_new_content_per_iteration": (
                 sum(it["new_content"] for it in iterations) / len(iterations)
-            ),
+            ) if "new_content" in iterations[0] else 0,
             "avg_time_per_iteration": (
                 sum(it["time"] for it in iterations) / len(iterations)
             )
@@ -2759,145 +2670,143 @@ Uses the Perplexity API to perform intelligent web searches and extract relevant
 
 import os
 import re
-from openai import OpenAI
-from typing import List, Dict, Any
-from rich import print as rprint
+import logging
+import requests
+from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 class PerplexityClient:
-    def __init__(self):
-        self.client = OpenAI(
-            api_key=os.getenv("PERPLEXITY_API_KEY"),
-            base_url="https://api.perplexity.ai"
-        )
+    """
+    A simple client that calls Perplexity's /chat/completions endpoint
+    using requests. See https://docs.perplexity.ai/api-reference/chat-completions
+    """
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.api_key = os.getenv("PERPLEXITY_API_KEY")
+        if not self.api_key:
+            raise ValueError("PERPLEXITY_API_KEY not set in environment variables.")
+        self.base_url = "https://api.perplexity.ai/chat/completions"
+
+        # Configuration
+        self.config = config or {}
+        self.model = self.config.get("model", "sonar")
+        self.request_timeout = self.config.get("request_timeout", 60)  # 60s default
+        self.system_message = "You are a research assistant helping to find accurate, up-to-date information."
         
-        self.model = "sonar-pro"
-        self.system_message = (
-            "You are a research assistant helping to find accurate and up-to-date information. "
-            "When providing information, always cite your sources in the format [Source: URL]. "
-            "Focus on finding specific, factual information and avoid speculation."
+        logger.info(
+            "PerplexityClient initialized with model=%s, timeout=%d",
+            self.model,
+            self.request_timeout
         )
-        
+
     def search(self, query: str) -> Dict[str, Any]:
         """
-        Perform a web search using the Perplexity API.
-        
-        Args:
-            query: The search query
-            
-        Returns:
-            Dict containing search results and extracted URLs
+        Perform a web search using the Perplexity /chat/completions API
+        by passing a short system message and a user message in the
+        'messages' array, along with any relevant parameters.
         """
+
+        # Build the messages array with system + user roles
+        messages = [
+            {
+                "role": "system",
+                "content": self.system_message
+            },
+            {
+                "role": "user",
+                "content": query
+            }
+        ]
+
+        # Prepare the JSON data to send
+        # (feel free to tweak parameters as needed, or add more)
+        data = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            # Example: filter the search domain, or remove it if you want all results
+            # "search_domain_filter": ["perplexity.ai"],
+            "return_images": False,
+            "return_related_questions": False,
+            "search_recency_filter": "month",
+            "top_k": 0,
+            "stream": False,
+            # presence_penalty and frequency_penalty can be adjusted as needed
+            "presence_penalty": 0,
+            "frequency_penalty": 1
+        }
+
+        # Log what we're about to send (for debug)
+        logger.info("Sending request to Perplexity with query='%s' and model=%s", query, self.model)
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_message},
-                    {"role": "user", "content": query}
-                ],
-                temperature=0.7,
-                stream=False
+            response = requests.post(
+                self.base_url,
+                headers=headers,
+                json=data,
+                timeout=self.request_timeout  # Add timeout to prevent hanging
             )
-            
-            content = response.choices[0].message.content
+            if not response.ok:
+                # Log and raise an error if the HTTP status is not 200
+                logger.error(
+                    "Perplexity API returned an error %d: %s",
+                    response.status_code,
+                    response.text
+                )
+                response.raise_for_status()
+
+            # Parse response JSON
+            resp_json = response.json()
+
+            # The assistant's text is typically in resp_json["choices"][0]["message"]["content"]
+            # We'll combine it in 'content' for consistency.
+            if "choices" in resp_json and len(resp_json["choices"]) > 0:
+                content = resp_json["choices"][0]["message"].get("content", "")
+            else:
+                content = ""
+
+            # Extract citations or references, if present
             urls = self._extract_urls(content)
-            
+            # Some Perplexity responses also have a top-level "citations" array
+            # to show references. We could merge them into `urls` if we like:
+            citations = resp_json.get("citations", [])
+            for citation_url in citations:
+                if citation_url not in urls:
+                    urls.append(citation_url)
+
             return {
                 "content": content,
                 "urls": urls
             }
-            
-        except Exception as e:
-            rprint(f"[red]Error in Perplexity search: {str(e)}[/red]")
+
+        except requests.RequestException as e:
+            logger.exception("Error in Perplexity search request:")
             return {
                 "content": "",
-                "urls": []
+                "urls": [],
+                "error": str(e)
             }
-            
+
     def _extract_urls(self, text: str) -> List[str]:
         """
-        Extract URLs from text, including those in citation format.
-        
-        Args:
-            text: Text to extract URLs from
-            
-        Returns:
-            List of extracted URLs
+        Extract URLs from any text. We also attempt to parse typical references like:
+        [Source: https://example.com]
         """
-        # Look for URLs in citation format [Source: URL]
-        citation_pattern = r'\[Source: (https?://[^\]]+)\]'
+        citation_pattern = r'\[Source:\s*(https?://[^\]]+)\]'
         citation_urls = re.findall(citation_pattern, text)
-        
-        # Also look for raw URLs
+
         url_pattern = r'https?://\S+'
         raw_urls = re.findall(url_pattern, text)
-        
-        # Combine and deduplicate URLs
+
         all_urls = list(set(citation_urls + raw_urls))
         return all_urls
-
-    def validate_url(self, url: str) -> bool:
-        """
-        Validate if a URL is accessible and safe to scrape.
-        """
-        import requests
-        from urllib.parse import urlparse
-        
-        try:
-            # Parse URL
-            parsed = urlparse(url)
-            if not all([parsed.scheme, parsed.netloc]):
-                return False
-                
-            # Check if URL is accessible
-            response = requests.head(url, timeout=5)
-            return response.status_code == 200
-            
-        except Exception:
-            return False 
-```
-
-## rat/research/utils/deepseek_client.py
-
-```python
-"""
-Utility for calling the deepseek-reasoner API.
-"""
-
-import requests
-from typing import Dict, Any
-
-class DeepSeekClient:
-    def __init__(self, api_key: str, model: str = "deepseek-reasoner"):
-        self.api_key = api_key
-        self.model = model
-        self.base_url = "https://api.deepseek.com"
-
-    def analyze(self, user_content: str, system_instruction: str, content_type: str) -> Dict[str, Any]:
-        """
-        Send content to deepseek-reasoner and return a JSON response.
-        Implement your actual network call here.
-        """
-        if not self.api_key:
-            raise ValueError("No DEEPSEEK_API_KEY provided.")
-
-        # Pseudocode for an API request:
-        # response = requests.post(
-        #     f"{self.base_url}/v1/completions",
-        #     headers={ "Authorization": f"Bearer {self.api_key}" },
-        #     json={
-        #         "model": self.model,
-        #         "system_instruction": system_instruction,
-        #         "user_content": user_content,
-        #         "metadata": {"content_type": content_type}
-        #     }
-        # )
-        # data = response.json()
-        #
-        # For demonstration, we will just mock it:
-        data = {
-            "analysis": f"[Mock deepseek analysis for {content_type}] {user_content[:100]}..."
-        }
-        return data
 ```
 
 ## rat_agentic.py
@@ -2908,112 +2817,94 @@ Entry point for the multi-agent research system.
 Provides a command-line interface for conducting research using the agent-based approach.
 """
 
+import os
 import sys
+import json
+import logging
 from rich import print as rprint
 from rich.panel import Panel
 from rich.markdown import Markdown
 from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
 from typing import Dict, Any, Optional
-import json
 
 from rat.research.orchestrator import ResearchOrchestrator
 
+def setup_logging():
+    log_path = "rat.log"
+    if os.path.exists(log_path):
+        os.remove(log_path)
+    logging.basicConfig(
+        filename=log_path,
+        filemode="w",
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+    logging.info("Logging setup complete. Logs overwritten each run.")
+
 def create_default_config() -> Dict[str, Any]:
-    """
-    Create default configuration for the research system.
-    
-    Returns:
-        Default configuration dictionary
-    """
     return {
         "max_iterations": 5,
         "min_new_content": 2,
         "min_confidence": 0.7,
-        
         "search_config": {
             "max_queries": 5,
             "min_priority": 0.3,
             "refinement_threshold": 0.7
         },
-        
         "explore_config": {
             "max_urls": 10,
             "min_priority": 0.3,
             "allowed_domains": []
         },
-        
         "reason_config": {
             "max_parallel_tasks": 3,
             "chunk_size": 30000,
             "min_priority": 0.3
-        },
-        
-        "execute_config": {
-            "model": "claude-3-5-sonnet-20241022",
-            "min_priority": 0.3,
-            "max_retries": 2
         }
     }
 
 def display_results(results: Dict[str, Any]):
-    """
-    Display research results in a formatted way.
-    
-    Args:
-        results: Research results to display
-    """
     if "error" in results:
         rprint(f"\n[red]Error during research: {results['error']}[/red]")
         return
-        
-    # Display paper
     rprint(Panel(
         Markdown(results["paper"]),
         title="[bold green]Research Paper[/bold green]",
         border_style="green"
     ))
-    
-    # Display metrics
     metrics = results.get("metrics", {})
-    
     rprint("\n[bold cyan]Research Metrics:[/bold cyan]")
     rprint(f"Total time: {metrics.get('total_time', 0):.2f} seconds")
     rprint(f"Iterations: {metrics.get('iterations', 0)}")
     rprint(f"Total decisions: {metrics.get('total_decisions', 0)}")
     rprint(f"Total content items: {metrics.get('total_content', 0)}")
-    
-    # Display agent metrics
     agent_metrics = metrics.get("agent_metrics", {})
     for agent_name, agent_data in agent_metrics.items():
         rprint(f"\n[bold]{agent_name.title()} Agent:[/bold]")
         rprint(f"Decisions made: {agent_data.get('decisions_made', 0)}")
         rprint(f"Successful executions: {agent_data.get('successful_executions', 0)}")
         rprint(f"Failed executions: {agent_data.get('failed_executions', 0)}")
-        rprint(
-            f"Average execution time: "
-            f"{agent_data.get('total_execution_time', 0) / max(agent_data.get('decisions_made', 1), 1):.2f}s"
-        )
+        total_decisions = max(agent_data.get("decisions_made", 1), 1)
+        avg_time = agent_data.get("total_execution_time", 0) / total_decisions
+        rprint(f"Average execution time: {avg_time:.2f}s")
 
 def main():
-    """Main entry point for the research system."""
-    # Initialize style
-    style = Style.from_dict({
-        'prompt': 'orange bold',
-    })
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    logger.info("Launching RAT from rat_agentic.py")
+
+    style = Style.from_dict({'prompt': 'orange bold'})
     session = PromptSession(style=style)
     
-    # Create orchestrator with default config
     orchestrator = ResearchOrchestrator(create_default_config())
     
-    # Display welcome message
     rprint(Panel.fit(
         "[bold cyan]RAT Multi-Agent Research System[/bold cyan]\n"
         "Conduct research using a coordinated team of specialized AI agents",
         title="[bold cyan]🧠 RAT Research[/bold cyan]",
         border_style="cyan"
     ))
-    
     rprint("[yellow]Commands:[/yellow]")
     rprint(" • Type [bold red]'quit'[/bold red] to exit")
     rprint(" • Type [bold magenta]'config'[/bold magenta] to view current configuration")
@@ -3025,42 +2916,44 @@ def main():
     while True:
         try:
             user_input = session.prompt("\nResearch Question: ", style=style).strip()
-            
             if user_input.lower() == 'quit':
+                logger.info("User chose to quit from rat_agentic.py")
                 rprint("\nGoodbye! 👋")
                 break
-                
             elif user_input.lower() == 'config':
+                logger.info("Displaying current configuration.")
+                config_str = json.dumps(orchestrator.config, indent=2)
                 rprint(Panel(
-                    Markdown(f"```json\n{json.dumps(orchestrator.config, indent=2)}\n```"),
+                    Markdown(f"```json\n{config_str}\n```"),
                     title="[bold cyan]Current Configuration[/bold cyan]",
                     border_style="cyan"
                 ))
                 continue
-                
             elif user_input.lower() == 'metrics':
                 if latest_results:
+                    logger.info("User requested metrics display for the latest research.")
                     display_results(latest_results)
                 else:
                     rprint("[yellow]No research has been conducted yet[/yellow]")
                 continue
-                
-            # Conduct research
-            rprint(f"\n[bold cyan]Starting research on:[/bold cyan] {user_input}")
+            if not user_input:
+                logger.debug("User provided empty input; ignoring.")
+                continue
+            logger.info("Starting research for input question: %s", user_input)
             latest_results = orchestrator.start_research(user_input)
-            
-            # Display results
             display_results(latest_results)
-            
         except KeyboardInterrupt:
+            logger.warning("User interrupted with Ctrl+C. Returning to prompt.")
             continue
         except EOFError:
+            logger.info("EOF received, exiting gracefully.")
             break
         except Exception as e:
+            logger.exception("Unhandled exception in main loop.")
             rprint(f"[red]Error: {str(e)}[/red]")
 
 if __name__ == "__main__":
-    main() 
+    main()
 ```
 
 ## setup.py
@@ -3096,5 +2989,79 @@ setup(
     ],
     python_requires=">=3.7",
 ) 
+```
+
+## test_agent.py
+
+```python
+"""
+Test script to run the research agent with a sample question.
+"""
+
+import os
+import logging
+from rich import print as rprint
+from rat.research.orchestrator import ResearchOrchestrator
+
+def setup_logging():
+    """
+    Configure logging so that logs are overwritten on each new run.
+    """
+    log_path = "rat.log"
+    if os.path.exists(log_path):
+        os.remove(log_path)
+
+    logging.basicConfig(
+        filename=log_path,
+        filemode="w",  # Overwrite mode
+        level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+    logging.info("Logging setup complete (test_agent). Logs overwritten each run.")
+
+def main():
+    # Ensure logging is set up
+    setup_logging()
+    logger = logging.getLogger(__name__)
+    logger.info("Starting test_agent.py main function.")
+    
+    # Initialize the orchestrator with default or custom config
+    orchestrator = ResearchOrchestrator()
+    
+    # Define a test question
+    question = (
+        "What are the main features and pricing of Billit's accounting software, "
+        "and how does it compare to competitors in Belgium?"
+    )
+    rprint(f"[bold cyan]Starting research on: {question}[/bold cyan]")
+    logger.info("Test question: %s", question)
+    
+    # Run the research
+    results = orchestrator.start_research(question)
+    
+    # Print results
+    if "error" in results:
+        rprint(f"[red]Error: {results['error']}[/red]")
+        logger.error("Research ended with an error: %s", results['error'])
+    else:
+        rprint("\n[bold green]Research completed![/bold green]")
+        logger.info("Research completed successfully.")
+        
+        rprint("\n[bold]Results:[/bold]")
+        print(results["paper"])
+        
+        rprint("\n[bold]Sources:[/bold]")
+        for source in results.get("sources", []):
+            print(f"- {source}")
+        
+        rprint("\n[bold]Metrics:[/bold]")
+        metrics = results.get("metrics", {})
+        print(f"Total time: {metrics.get('total_time', 0):.2f} seconds")
+        print(f"Iterations: {metrics.get('iterations', 0)}")
+        print(f"Total decisions: {metrics.get('total_decisions', 0)}")
+        print(f"Total content items: {metrics.get('total_content', 0)}")
+
+if __name__ == "__main__":
+    main() 
 ```
 
