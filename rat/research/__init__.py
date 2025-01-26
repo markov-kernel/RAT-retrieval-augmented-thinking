@@ -4,7 +4,13 @@ This module provides research capabilities for the RAT system.
 """
 
 from .perplexity_client import PerplexityClient
-from .jina_client import JinaClient
-from .session import ResearchSession
+from .firecrawl_client import FirecrawlClient
+from .orchestrator import ResearchOrchestrator
+from .output_manager import OutputManager
 
-__all__ = ['PerplexityClient', 'JinaClient', 'ResearchSession'] 
+__all__ = [
+    'PerplexityClient',
+    'FirecrawlClient',
+    'ResearchOrchestrator',
+    'OutputManager'
+]

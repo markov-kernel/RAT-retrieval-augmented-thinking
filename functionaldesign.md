@@ -1,101 +1,96 @@
-# RAT Research - Functional Design Document
+# RAT (Retrieval Augmented Thinking) - Functional Design
 
 ## Overview
-RAT Research is an enhanced version of the Retrieval Augmented Thinking (RAT) system that adds web research capabilities through Perplexity API and Jina Reader for comprehensive research paper generation.
+RAT is a multi-agent system for conducting research and generating insights through a combination of specialized AI agents. The system uses multiple AI models and APIs to search, explore, reason about, and execute tasks based on user queries.
 
-## Core Components
+## System Architecture
 
-### 1. Model Chain (from RAT)
-- Maintains the existing DeepSeek reasoning capabilities
-- Integrates with OpenRouter for response generation
-- Preserves conversation history and model switching functionality
+### Core Components
 
-### 2. Research Components (New)
-- Perplexity API Integration for web searches
-- Jina Reader API for web scraping and content extraction
-- URL extraction and validation
-- Content aggregation and synthesis
+1. **Search Agent (Perplexity)**
+   - Handles web search queries
+   - Returns relevant content and URLs
+   - Uses Perplexity API for intelligent search
 
-### 3. Output Generation
-- Markdown formatted research papers
-- Structured sections (Introduction, Methods, Findings, Conclusion)
-- Citation management
-- Source tracking
+2. **Explore Agent (Firecrawl)**
+   - Extracts content from discovered URLs
+   - Processes and cleans webpage content
+   - Uses Firecrawl API for content extraction
 
-## Workflow
+3. **Reasoning Agent (DeepSeek)**
+   - Analyzes gathered information
+   - Supports parallel processing for large contexts
+   - Uses deepseek-reasoner for analysis
 
-1. User Input Processing
-   - Accept research questions via command line interface
-   - Parse and validate input
+4. **Execution Agent (Claude)**
+   - Generates code and structured output
+   - Handles specific execution tasks
+   - Uses claude-3-5-sonnet for precise outputs
 
-2. Initial Research Phase
-   - Conduct Perplexity API searches
-   - Extract relevant URLs from search results
-   - Store initial findings
+### Orchestrator
+- Coordinates agent interactions
+- Manages research workflow
+- Handles data persistence and retrieval
 
-3. Deep Research Phase
-   - Use Jina Reader to scrape and analyze cited URLs
-   - Extract relevant content and metadata
-   - Validate and clean extracted data
+## Data Flow
 
-4. Synthesis Phase
-   - Use DeepSeek for reasoning about collected information
-   - Generate structured research outline
-   - Synthesize findings into coherent sections
+1. User submits research query
+2. Search Agent gathers initial information
+3. Explore Agent processes discovered URLs
+4. Reasoning Agent analyzes collected data
+5. Optional: Execution Agent generates structured output
+6. Results saved to research_outputs directory
 
-5. Output Generation
-   - Format research paper in Markdown
-   - Include proper citations and references
-   - Generate executive summary
+## Key Features
+
+- Multi-agent architecture
+- Iterative research process
+- Parallel processing capability
+- Structured output generation
+- Persistent storage of results
 
 ## Technical Requirements
 
+### Environment Variables
+```
+DEEPSEEK_API_KEY
+PERPLEXITY_API_KEY
+FIRECRAWL_API_KEY
+ANTHROPIC_API_KEY
+```
+
 ### Dependencies
-- OpenAI API (for DeepSeek and OpenRouter)
-- Perplexity API
-- Jina Reader API
-- Web scraping utilities
-- Markdown processing libraries
+- openai
+- python-dotenv
+- rich
+- prompt_toolkit
+- requests
+- firecrawl
+- anthropic
 
-### Environment Configuration
-- API keys stored in .env file
-- Configuration management
-- Rate limiting and error handling
+## Output Format
 
-### Data Structures
-- Research session object
-- Source tracking
-- Citation management
-- Content cache
-
-## Command Line Interface
-
-### Commands
-- `research <question>` - Start new research
-- `model <name>` - Switch models (inherited from RAT)
-- `reasoning` - Toggle reasoning visibility
-- `clear` - Clear research session
-- `export` - Export research paper
-- `quit` - Exit application
+Research outputs are stored in timestamped directories containing:
+- research_paper.md (main findings)
+- metadata.json (research metadata)
+- sources/ (extracted source content)
 
 ## Future Improvements
-- PDF export capability
-- Multiple research paper formats
-- Citation style options
-- Research progress tracking
-- Source reliability scoring
-- Content summarization options
 
-## Error Handling
-- API failure recovery
-- Rate limit management
-- Invalid URL handling
-- Content extraction fallbacks
-- Session persistence
+1. Enhanced parallelization
+2. Additional agent types
+3. Improved source validation
+4. Advanced error handling
+5. Query optimization
 
-## Security Considerations
-- API key protection
-- URL validation
-- Content sanitization
-- Rate limiting
-- Error logging 
+## Usage
+
+```bash
+# Install
+pip install -e .
+
+# Run
+python rat_agentic.py
+# or
+rat-agentic
+``` 

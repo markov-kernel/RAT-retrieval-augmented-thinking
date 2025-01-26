@@ -1,152 +1,208 @@
 """
 Output manager for research results.
-Handles saving and organizing research outputs in a structured way.
+Handles saving research outputs, intermediate results, and performance metrics.
 """
 
 import os
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
-import re
-from rich import print as rprint
+from typing import Dict, Any, List
+import shutil
 
 class OutputManager:
-    def __init__(self, base_dir: str = "research_outputs"):
+    """
+    Manages research outputs and metrics.
+    
+    Handles:
+    - Creating research directories
+    - Saving research papers
+    - Tracking intermediate results
+    - Recording performance metrics
+    """
+    
+    def __init__(self):
+        """Initialize the output manager."""
+        self.base_dir = Path("research_outputs")
+        
+    def create_research_dir(self, question: str) -> Path:
         """
-        Initialize the output manager.
+        Create a directory for research outputs.
         
         Args:
-            base_dir: Base directory for research outputs
-        """
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        
-    def create_research_dir(self, research_question: str) -> Path:
-        """
-        Create a directory for the current research session.
-        
-        Args:
-            research_question: The research question being investigated
+            question: Research question
             
         Returns:
-            Path to the research directory
+            Path to created directory
         """
-        # Create a safe directory name from the research question
-        safe_name = self._create_safe_dirname(research_question)
-        
-        # Add timestamp for uniqueness
+        # Create timestamped directory name
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dir_name = f"{timestamp}_{safe_name}"
+        dir_name = f"{timestamp}_{self._sanitize_filename(question[:50])}"
         
-        # Create the directory
+        # Create directory
         research_dir = self.base_dir / dir_name
         research_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save the original research question
-        self._save_research_info(research_dir, research_question)
+        # Save initial metadata
+        self.save_metadata(research_dir, {
+            "question": question,
+            "started_at": timestamp,
+            "status": "in_progress"
+        })
         
         return research_dir
         
-    def save_research_paper(self, research_dir: Path, content: Dict[str, Any]) -> Path:
+    def save_research_paper(self, research_dir: Path, paper: Dict[str, Any]):
         """
-        Save the research paper and its metadata.
+        Save the research paper and update metadata.
         
         Args:
-            research_dir: Directory to save the paper in
-            content: Research paper content and metadata
-            
-        Returns:
-            Path to the saved paper
+            research_dir: Research output directory
+            paper: Paper content and metadata
         """
-        try:
-            # Save the main paper
-            paper_path = research_dir / "research_paper.md"
-            with open(paper_path, "w", encoding="utf-8") as f:
-                f.write(content["paper"])
-                
-            # Save metadata
-            meta_path = research_dir / "metadata.json"
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "title": content.get("title", ""),
-                    "timestamp": datetime.now().isoformat(),
-                    "sources": content.get("sources", []),
-                    "stats": {
-                        "word_count": len(content["paper"].split()),
-                        "source_count": len(content.get("sources", [])),
-                        "section_count": content["paper"].count("#")
-                    }
-                }, f, indent=2)
-                
-            rprint(f"[green]Research paper saved to {paper_path}[/green]")
-            return paper_path
-            
-        except Exception as e:
-            rprint(f"[red]Error saving research paper: {str(e)}[/red]")
-            return None
-            
-    def save_source_content(self, research_dir: Path, source_content: Dict[str, Any]) -> Path:
-        """
-        Save extracted content from a source.
+        # Save paper content
+        paper_path = research_dir / "research_paper.md"
+        paper_path.write_text(paper["paper"])
         
-        Args:
-            research_dir: Directory to save the source in
-            source_content: Content and metadata from the source
-            
-        Returns:
-            Path to the saved source
-        """
-        try:
-            # Create sources directory
-            sources_dir = research_dir / "sources"
-            sources_dir.mkdir(exist_ok=True)
-            
-            # Create a safe filename from the title or URL
-            filename = self._create_safe_filename(
-                source_content.get("title") or 
-                source_content.get("metadata", {}).get("url", "source")
-            )
-            
-            # Save the source content
-            source_path = sources_dir / f"{filename}.md"
-            with open(source_path, "w", encoding="utf-8") as f:
-                # Write metadata header
-                f.write("---\n")
-                json.dump(source_content["metadata"], f, indent=2)
-                f.write("\n---\n\n")
-                
-                # Write content
-                f.write(source_content["text"])
-                
-            return source_path
-            
-        except Exception as e:
-            rprint(f"[red]Error saving source content: {str(e)}[/red]")
-            return None
-            
-    def _create_safe_dirname(self, name: str, max_length: int = 50) -> str:
-        """Create a safe directory name from a string."""
-        # Remove special characters and spaces
-        safe = re.sub(r'[^\w\s-]', '', name)
-        safe = re.sub(r'[-\s]+', '_', safe).strip('-_')
-        
-        # Truncate if too long
-        if len(safe) > max_length:
-            safe = safe[:max_length]
-            
-        return safe
-        
-    def _create_safe_filename(self, name: str, max_length: int = 100) -> str:
-        """Create a safe filename from a string."""
-        return self._create_safe_dirname(name, max_length)
-        
-    def _save_research_info(self, research_dir: Path, question: str) -> None:
-        """Save the original research question and timestamp."""
+        # Save paper info
         info_path = research_dir / "research_info.json"
-        with open(info_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "question": question,
-                "timestamp": datetime.now().isoformat(),
-                "version": "1.0"
-            }, f, indent=2) 
+        info = {
+            "title": paper["title"],
+            "sources": paper["sources"],
+            "metrics": paper.get("metrics", {})
+        }
+        info_path.write_text(json.dumps(info, indent=2))
+        
+        # Update metadata
+        self.save_metadata(research_dir, {
+            "status": "completed",
+            "completed_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "metrics": paper.get("metrics", {})
+        })
+        
+    def save_context_state(self, research_dir: Path, context_data: Dict[str, Any]):
+        """
+        Save intermediate context state.
+        
+        Args:
+            research_dir: Research output directory
+            context_data: Context state to save
+        """
+        # Create states directory
+        states_dir = research_dir / "states"
+        states_dir.mkdir(exist_ok=True)
+        
+        # Save state with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        state_path = states_dir / f"context_state_{timestamp}.json"
+        state_path.write_text(json.dumps(context_data, indent=2))
+        
+        # Keep only last 5 states to save space
+        self._cleanup_old_states(states_dir)
+        
+    def save_iteration_metrics(
+        self,
+        research_dir: Path,
+        iterations: List[Dict[str, Any]]
+    ):
+        """
+        Save iteration performance metrics.
+        
+        Args:
+            research_dir: Research output directory
+            iterations: List of iteration metrics
+        """
+        metrics_path = research_dir / "iteration_metrics.json"
+        metrics_path.write_text(json.dumps({
+            "iterations": iterations,
+            "summary": self._calculate_metrics_summary(iterations)
+        }, indent=2))
+        
+    def save_metadata(self, research_dir: Path, updates: Dict[str, Any]):
+        """
+        Update research session metadata.
+        
+        Args:
+            research_dir: Research output directory
+            updates: Metadata updates
+        """
+        metadata_path = research_dir / "metadata.json"
+        
+        # Load existing metadata
+        if metadata_path.exists():
+            current_metadata = json.loads(metadata_path.read_text())
+        else:
+            current_metadata = {}
+            
+        # Update metadata
+        current_metadata.update(updates)
+        
+        # Save updated metadata
+        metadata_path.write_text(json.dumps(current_metadata, indent=2))
+        
+    def _sanitize_filename(self, name: str) -> str:
+        """
+        Create a safe filename from text.
+        
+        Args:
+            name: Text to convert to filename
+            
+        Returns:
+            Safe filename
+        """
+        # Replace unsafe characters
+        safe_chars = "-_"
+        filename = "".join(
+            c if c.isalnum() or c in safe_chars else "_"
+            for c in name
+        )
+        return filename.strip("_")
+        
+    def _cleanup_old_states(self, states_dir: Path):
+        """
+        Keep only the most recent state files.
+        
+        Args:
+            states_dir: Directory containing state files
+        """
+        state_files = sorted(
+            states_dir.glob("context_state_*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True
+        )
+        
+        # Remove old files
+        for file in state_files[5:]:  # Keep 5 most recent
+            file.unlink()
+            
+    def _calculate_metrics_summary(
+        self,
+        iterations: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Calculate summary metrics across iterations.
+        
+        Args:
+            iterations: List of iteration metrics
+            
+        Returns:
+            Summary metrics
+        """
+        if not iterations:
+            return {}
+            
+        return {
+            "total_iterations": len(iterations),
+            "total_decisions": sum(it["decisions"] for it in iterations),
+            "total_new_content": sum(it["new_content"] for it in iterations),
+            "total_time": sum(it["time"] for it in iterations),
+            "avg_decisions_per_iteration": (
+                sum(it["decisions"] for it in iterations) / len(iterations)
+            ),
+            "avg_new_content_per_iteration": (
+                sum(it["new_content"] for it in iterations) / len(iterations)
+            ),
+            "avg_time_per_iteration": (
+                sum(it["time"] for it in iterations) / len(iterations)
+            )
+        }
