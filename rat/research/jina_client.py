@@ -10,6 +10,7 @@ import requests
 from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 from rich import print as rprint
+from urllib.parse import quote
 
 load_dotenv()
 
@@ -19,15 +20,10 @@ class JinaClient:
         if not self.api_key:
             raise ValueError("JINA_API_KEY not found in environment variables")
         
-        self.base_url = "https://api.jina.ai/reader/crawl"
+        self.base_url = "https://r.jina.ai"
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-Respond-With": "markdown",  # Get markdown format
-            "X-With-Generated-Alt": "true",  # Enable alt text generation
-            "X-With-Images-Summary": "true",  # Include image summaries
-            "X-With-Links-Summary": "true"  # Include link summaries
+            "Accept": "application/json"
         }
         
     def extract_content(self, url: str) -> Dict[str, Any]:
@@ -41,34 +37,42 @@ class JinaClient:
             Dict containing extracted content and metadata
         """
         try:
-            payload = {
-                "url": url,
-                "engine": "readerlm-v2",  # Use the latest reader model
-                "retainImages": "all",  # Keep all images
-                "withGeneratedAlt": True,  # Generate alt text for images
-                "withImagesSummary": True,  # Include image summaries
-                "withLinksSummary": True,  # Include link summaries
-                "noCache": False,  # Use caching for better performance
-                "timeout": 60  # 60 second timeout
-            }
+            # URL encode the target URL and append it to the base URL
+            # The format should be: https://r.jina.ai/https://example.com
+            if not url.startswith(('http://', 'https://')):
+                url = 'https://' + url
+                
+            full_url = f"{self.base_url}/{url}"
             
-            response = requests.post(
-                self.base_url,
+            # Make the request
+            response = requests.get(
+                full_url,
                 headers=self.headers,
-                json=payload
+                timeout=60  # 60 second timeout
             )
             response.raise_for_status()
             
-            data = response.json()
+            # Parse the response
+            if response.headers.get('content-type', '').startswith('application/json'):
+                data = response.json()
+            else:
+                # Extract text content
+                text = response.text
+                # Basic cleaning of HTML if present
+                text = text.replace('<br>', '\n').replace('</p>', '\n\n')
+                data = {"content": text}
+                
             return self._process_extracted_content(data)
             
         except requests.exceptions.RequestException as e:
-            rprint(f"[red]Jina Reader API request failed: {str(e)}[/red]")
+            rprint(f"[red]Jina Reader API request failed for {url}: {str(e)}[/red]")
             return {
                 "title": "",
                 "text": "",
-                "metadata": {},
-                "error": str(e)
+                "metadata": {
+                    "url": url,
+                    "error": str(e)
+                }
             }
             
     def _process_extracted_content(self, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -81,20 +85,29 @@ class JinaClient:
         Returns:
             Processed and cleaned content
         """
-        # Extract from the correct response structure
-        content = data.get("data", "")  # Content is in the data field
-        meta = data.get("meta", {})
+        # Extract content and metadata from response
+        content = data.get("content", "")
+        if isinstance(content, dict):
+            # Handle structured content
+            text = content.get("text", "")
+            title = content.get("title", "")
+            metadata = content.get("metadata", {})
+        else:
+            # Handle plain text content
+            text = str(content)
+            title = ""
+            metadata = {}
         
         processed = {
-            "title": meta.get("title", ""),
-            "text": content,  # Main content is in data field
+            "title": title,
+            "text": text,
             "metadata": {
-                "author": meta.get("author", ""),
-                "published_date": meta.get("published_date", ""),
-                "url": meta.get("url", ""),
-                "domain": meta.get("domain", ""),
-                "word_count": meta.get("word_count", 0),
-                "language": meta.get("language", "")
+                "url": metadata.get("url", ""),
+                "author": metadata.get("author", ""),
+                "published_date": metadata.get("published_date", ""),
+                "domain": metadata.get("domain", ""),
+                "word_count": len(text.split()) if text else 0,
+                "language": metadata.get("language", "")
             }
         }
         
