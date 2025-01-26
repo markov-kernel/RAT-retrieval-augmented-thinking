@@ -207,7 +207,6 @@ class ReasoningAgent(BaseAgent):
             item for item in search_results
             if not item.metadata.get("analyzed_by_reasoner")
         ]
-        
         unprocessed_explored = [
             item for item in explored_content
             if not item.metadata.get("analyzed_by_reasoner")
@@ -231,42 +230,74 @@ class ReasoningAgent(BaseAgent):
                 )
             )
         
-        # 4. Check for knowledge gaps
-        analysis_items = context.get_content("main", ContentType.ANALYSIS)
-        combined_analysis = " ".join(str(a.content) for a in analysis_items)
-        
-        gaps = self._identify_knowledge_gaps(
-            context.initial_question,
-            combined_analysis
+        # 4. Check for knowledge gaps - but only if we have context
+        # Build combined text from search results, explored content, and existing analysis
+        search_text = "\n".join(
+            str(item.content) 
+            for item in search_results 
+            if isinstance(item.content, str)
         )
+        explored_text = "\n".join(
+            str(item.content) 
+            for item in explored_content 
+            if isinstance(item.content, str)
+        )
+        analysis_items = context.get_content("main", ContentType.ANALYSIS)
+        analysis_text = "\n".join(
+            item.content.get("analysis", "")
+            if isinstance(item.content, dict) else str(item.content)
+            for item in analysis_items
+        )
+
+        combined_analysis = f"{search_text}\n\n{explored_text}\n\n{analysis_text}".strip()
         
-        # Create new SEARCH or EXPLORE decisions for gaps
-        for gap in gaps:
-            if gap["type"] == "search":
-                decisions.append(
-                    ResearchDecision(
-                        decision_type=DecisionType.SEARCH,
-                        priority=0.8,
-                        context={
-                            "query": gap["query"],
-                            "rationale": gap["rationale"]
-                        },
-                        rationale=f"Fill knowledge gap: {gap['rationale']}"
-                    )
-                )
-            elif gap["type"] == "explore":
-                if gap["url"] not in self.explored_urls:
+        if combined_analysis:  # Only check for gaps if we have some real context
+            gaps = self._identify_knowledge_gaps(
+                context.initial_question,
+                combined_analysis
+            )
+            
+            # Filter out any gaps with placeholders
+            filtered_gaps = []
+            for gap in gaps:
+                query_str = gap.get("query", "")
+                url_str = gap.get("url", "")
+                # Skip if the LLM hallucinated placeholders
+                if "[" in query_str or "]" in query_str or "[" in url_str or "]" in url_str:
+                    self.logger.warning(f"Skipping gap with placeholders: {gap}")
+                    continue
+                filtered_gaps.append(gap)
+            
+            # Create new SEARCH or EXPLORE decisions for filtered gaps
+            for gap in filtered_gaps:
+                if gap["type"] == "search":
                     decisions.append(
                         ResearchDecision(
-                            decision_type=DecisionType.EXPLORE,
-                            priority=0.75,
+                            decision_type=DecisionType.SEARCH,
+                            priority=0.8,
                             context={
-                                "url": gap["url"],
+                                "query": gap["query"],
                                 "rationale": gap["rationale"]
                             },
-                            rationale=f"Explore URL for more details: {gap['rationale']}"
+                            rationale=f"Fill knowledge gap: {gap['rationale']}"
                         )
                     )
+                elif gap["type"] == "explore":
+                    if gap["url"] not in self.explored_urls:
+                        decisions.append(
+                            ResearchDecision(
+                                decision_type=DecisionType.EXPLORE,
+                                priority=0.75,
+                                context={
+                                    "url": gap["url"],
+                                    "rationale": gap["rationale"]
+                                },
+                                rationale=f"Explore URL for more details: {gap['rationale']}"
+                            )
+                        )
+        else:
+            # No real context yet, skip knowledge gap detection
+            self.logger.info("Skipping knowledge gap analysis because we have no contextual text.")
         
         # 5. Check if we should terminate
         if self._should_terminate(context):
@@ -527,14 +558,27 @@ class ReasoningAgent(BaseAgent):
         """
         Identify missing information and suggest next steps.
         Skip any suggestions containing placeholder text in brackets.
+        
+        Args:
+            question: The research question being investigated
+            current_analysis: Combined text from search results, explored content, and analysis
+            
+        Returns:
+            List of gap dictionaries, each containing type (search/explore), query/url, and rationale
         """
         prompt = (
             "You are an advanced research assistant. Given a research question and current analysis, "
-            "identify missing info and suggest next steps as search or explore. "
-            "NO placeholders. Output in valid JSON array ONLY.\n\n"
-            f"QUESTION: {question}\n\n"
+            "identify specific missing information and suggest concrete next steps.\n\n"
+            "IMPORTANT RULES:\n"
+            "1. DO NOT use placeholders like [company name] or [person] - only suggest specific, concrete queries/URLs\n"
+            "2. Base your suggestions ONLY on the actual content provided\n"
+            "3. If you can't identify specific gaps, return an empty array\n"
+            "4. Each suggestion must be actionable and clearly related to the research question\n\n"
+            f"RESEARCH QUESTION: {question}\n\n"
             f"CURRENT ANALYSIS:\n{current_analysis}\n\n"
-            "JSON format: [{\"type\": \"search\"|\"explore\", \"query\"|\"url\": \"...\", \"rationale\": \"...\"}]"
+            "Respond with a JSON array of gaps in this format:\n"
+            '[{"type": "search"|"explore", "query"|"url": "specific text", "rationale": "why needed"}]\n'
+            "Return ONLY the JSON array, no other text."
         )
         
         try:
@@ -542,44 +586,54 @@ class ReasoningAgent(BaseAgent):
             if not content_str:
                 return []
             
-            # minimal code removing code blocks
-            if content_str.startswith("```"):
-                start_idx = content_str.find("\n") + 1
-                end_idx = content_str.rfind("```")
-                if end_idx > start_idx:
-                    content_str = content_str[start_idx:end_idx].strip()
-                else:
-                    content_str = content_str.replace("```", "").strip()
-            content_str = content_str.strip()
+            # Clean up the response
+            content_str = self._clean_json_response(content_str)
             
-            # parse
             try:
                 gaps = json.loads(content_str)
                 if not isinstance(gaps, list):
                     return []
                 
-                # Filter out any gaps with placeholders
+                # Filter out any gaps with placeholders or invalid structure
                 filtered_gaps = []
                 for gap in gaps:
-                    # Check both query and url fields for placeholders
-                    query = gap.get("query", "")
-                    url = gap.get("url", "")
+                    if not isinstance(gap, dict):
+                        continue
+                        
+                    # Validate required fields
+                    if "type" not in gap or gap["type"] not in ["search", "explore"]:
+                        continue
                     
-                    has_placeholder = False
-                    if re.search(r"\[.*?\]", query) or re.search(r"\[.*?\]", url):
-                        logger.warning(f"Skipping gap with placeholders: {query or url}")
-                        has_placeholder = True
-                        
-                    if not has_placeholder:
-                        filtered_gaps.append(gap)
-                        
+                    # Get the relevant field based on type
+                    content_field = "query" if gap["type"] == "search" else "url"
+                    if content_field not in gap or "rationale" not in gap:
+                        continue
+                    
+                    content_str = gap[content_field]
+                    rationale_str = gap["rationale"]
+                    
+                    # Skip if any field contains placeholders
+                    if (
+                        "[" in content_str or "]" in content_str or 
+                        "[" in rationale_str or "]" in rationale_str
+                    ):
+                        self.logger.warning(
+                            f"Skipping gap with placeholders: {content_str}"
+                        )
+                        continue
+                    
+                    filtered_gaps.append(gap)
+                
                 return filtered_gaps
                 
             except json.JSONDecodeError:
+                self.logger.error("Failed to parse knowledge gaps JSON response")
                 return []
-        except Exception:
+                
+        except Exception as e:
+            self.logger.error(f"Error identifying knowledge gaps: {str(e)}")
             return []
-        
+
     def _clean_json_response(self, content: str) -> str:
         """Helper to clean up JSON responses from the model."""
         content = content.strip()

@@ -301,10 +301,28 @@ class ResearchOrchestrator:
             rprint("[green]Terminating: ReasoningAgent indicated completion.[/green]")
             return True
         
-        # 2) Backup: If we got no new content
-        if len(iteration.content_added) < self.min_new_content:
-            rprint("[yellow]Terminating: No further new content was added.[/yellow]")
-            return True
+        # 2) Get fresh decisions from all agents to check if there's more work to do
+        try:
+            # Get new decisions from each agent
+            reason_decisions = self.reason_agent.analyze(self.current_context)
+            search_decisions = self.search_agent.analyze(self.current_context)
+            explore_decisions = self.explore_agent.analyze(self.current_context)
+            
+            # Filter out duplicate searches
+            valid_decisions = [
+                d for d in (reason_decisions + search_decisions + explore_decisions)
+                if (d.decision_type != DecisionType.SEARCH or 
+                    d.context.get("query", "").strip() not in self.previous_searches)
+            ]
+            
+            if not valid_decisions:
+                rprint("[yellow]Terminating: No further valid decisions from any agent.[/yellow]")
+                return True
+                
+        except Exception as e:
+            rprint(f"[red]Error checking for new decisions: {str(e)}[/red]")
+            # On error, continue the research to be safe
+            return False
         
         return False
         

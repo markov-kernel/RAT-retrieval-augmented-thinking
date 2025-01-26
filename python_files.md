@@ -710,33 +710,32 @@ class AnalysisTask:
 
 class ReasoningAgent(BaseAgent):
     """
-    Agent responsible for analyzing content using the Gemini 2.0 Flash Thinking model
-    and for driving the overall research flow.
-    
-    - Splits content into chunks if exceeding the input token limit (1,048,576).
-    - Runs parallel analysis with multiple calls to Gemini if needed.
-    - Merges results and can produce further decisions (SEARCH, EXPLORE) if needed.
-    - Potentially decides when to TERMINATE.
+    Reasoning agent for analyzing research content using the Gemini 2.0 Flash Thinking model.
+    Now it also acts as the "lead agent" that decides next steps (search, explore, etc.).
+    Supports parallel processing of content analysis and decision making.
     """
     
-    def __init__(self, config=None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        """Initialize the reasoning agent."""
         super().__init__("reason", config)
         
+        # Configure Gemini model
+        self.generation_config = {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 50000,
+            "response_mime_type": "text/plain"
+        }
+        self.model_name = "gemini-2.0-flash-thinking-exp-01-21"
+
+        # Initialize the model
+        self._model = None
+
         # Initialize logger
         self.logger = logging.getLogger(__name__)
 
         # Configure the Gemini client
         genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-
-        # We'll store these generation settings to pass each call
-        self.generation_config = {
-            "temperature": 0.7,
-            "top_p": 0.95,
-            "top_k": 64,
-            "max_output_tokens": 65536,       # Up to 65k tokens out
-            "response_mime_type": "text/plain"
-        }
-        self.model_name = "gemini-2.0-flash-thinking-exp-01-21"
 
         # We'll chunk input up to a 1,048,576 token estimate
         self.max_tokens_per_call = 1048576  
@@ -766,6 +765,20 @@ class ReasoningAgent(BaseAgent):
         # Tracking
         self.analysis_tasks: Dict[str, AnalysisTask] = {}
         
+    @property
+    def model(self):
+        """Lazy initialization of the Gemini model."""
+        if self._model is None:
+            self._model = genai.GenerativeModel(
+                model_name=self.model_name,
+                generation_config=self.generation_config
+            )
+        return self._model
+
+    def _get_model(self) -> genai.GenerativeModel:
+        """Get or create the Gemini model instance."""
+        return self.model  # Use the property
+
     def _enforce_flash_fix_limit(self):
         """
         Ensure we do not exceed flash_fix_rate_limit requests per minute.
@@ -1040,10 +1053,7 @@ class ReasoningAgent(BaseAgent):
         self._enforce_rate_limit()
         
         # Create a chat session
-        model = genai.GenerativeModel(
-            model_name=self.model_name,
-            generation_config=self.generation_config
-        )
+        model = self._get_model()
         chat_session = model.start_chat(history=[])
 
         # We explicitly instruct the model to avoid placeholders and next steps
@@ -1131,7 +1141,7 @@ class ReasoningAgent(BaseAgent):
             "temperature": 0.0,
             "top_p": 0.0,
             "top_k": 1,
-            "max_output_tokens": 1024,
+            "max_output_tokens": 8000,
         }
         
         fix_model = genai.GenerativeModel(
@@ -1161,10 +1171,7 @@ class ReasoningAgent(BaseAgent):
         api_logger.debug(f"Prompt: {prompt}")
         
         try:
-            model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config=self.generation_config
-            )
+            model = self._get_model()
             chat = model.start_chat(history=[])
             response = chat.send_message(prompt)
             
@@ -1845,6 +1852,9 @@ import time
 import logging
 from rich import print as rprint
 from pathlib import Path
+import textwrap
+from weasyprint import HTML
+import markdown
 
 from .agents.search import SearchAgent
 from .agents.explore import ExploreAgent
@@ -2132,10 +2142,28 @@ class ResearchOrchestrator:
             rprint("[green]Terminating: ReasoningAgent indicated completion.[/green]")
             return True
         
-        # 2) Backup: If we got no new content
-        if len(iteration.content_added) < self.min_new_content:
-            rprint("[yellow]Terminating: No further new content was added.[/yellow]")
-            return True
+        # 2) Get fresh decisions from all agents to check if there's more work to do
+        try:
+            # Get new decisions from each agent
+            reason_decisions = self.reason_agent.analyze(self.current_context)
+            search_decisions = self.search_agent.analyze(self.current_context)
+            explore_decisions = self.explore_agent.analyze(self.current_context)
+            
+            # Filter out duplicate searches
+            valid_decisions = [
+                d for d in (reason_decisions + search_decisions + explore_decisions)
+                if (d.decision_type != DecisionType.SEARCH or 
+                    d.context.get("query", "").strip() not in self.previous_searches)
+            ]
+            
+            if not valid_decisions:
+                rprint("[yellow]Terminating: No further valid decisions from any agent.[/yellow]")
+                return True
+                
+        except Exception as e:
+            rprint(f"[red]Error checking for new decisions: {str(e)}[/red]")
+            # On error, continue the research to be safe
+            return False
         
         return False
         
@@ -2181,61 +2209,142 @@ class ResearchOrchestrator:
         }
         return type_map.get(decision.decision_type, ContentType.OTHER)
         
+    def _generate_comprehensive_paper_markdown(self, context: ResearchContext) -> str:
+        """
+        Make a second call to Gemini to produce a very thorough Markdown report,
+        using all discovered search results, explored text, and analyses.
+        """
+        # 1) Gather up all final relevant data
+        search_items = context.get_content("main", ContentType.SEARCH_RESULT)
+        explored_items = context.get_content("main", ContentType.EXPLORED_CONTENT)
+        analysis_items = context.get_content("main", ContentType.ANALYSIS)
+
+        # Combine them into one big text corpus
+        combined_corpus = []
+
+        combined_corpus.append("### Final Consolidated Research\n")
+        combined_corpus.append("[SEARCH RESULTS]\n")
+        for s in search_items:
+            combined_corpus.append(str(s.content))
+
+        combined_corpus.append("\n[EXPLORED CONTENT]\n")
+        for e in explored_items:
+            combined_corpus.append(str(e.content))
+
+        combined_corpus.append("\n[ANALYSIS TEXT]\n")
+        for a in analysis_items:
+            if isinstance(a.content, dict):
+                combined_corpus.append(a.content.get("analysis", ""))
+            else:
+                combined_corpus.append(str(a.content))
+
+        big_text = "\n\n".join(combined_corpus)
+
+        # 2) Build a specialized prompt for the final deep-dive Markdown
+        prompt = textwrap.dedent(f"""
+            You are an advanced AI that just completed a comprehensive multi-step research.
+            Now produce a SINGLE, richly detailed research paper in valid Markdown.
+            Incorporate all relevant facts, context, analysis, and insights from the text below.
+            
+            Provide a thorough, well-structured breakdown:
+            - Large headings
+            - Subheadings
+            - Bullet points
+            - Tables if relevant
+            - Detailed comparisons and references
+
+            Return ONLY Markdown. No extra JSON or placeholders.
+
+            RESEARCH CORPUS:
+            {big_text}
+
+            Please produce the final research paper in Markdown now:
+        """).strip()
+
+        # 3) Make the LLM call using the ReasoningAgent's model
+        final_markdown = self._call_gemini_for_report(prompt)
+        return final_markdown
+
+    def _call_gemini_for_report(self, prompt: str) -> str:
+        """
+        Minimal method to do a single-turn call to the same Gemini model used by ReasoningAgent.
+        Return the raw text (which should be valid Markdown).
+        """
+        try:
+            # Reuse the ReasoningAgent's model for consistency
+            response = self.reason_agent.model.generate_content(prompt)
+            text = response.text.strip()
+            
+            # Clean markdown code blocks if present
+            if text.startswith("```"):
+                # Find the first newline after the opening ```
+                start_idx = text.find("\n") + 1
+                # Find the last ``` and exclude it
+                end_idx = text.rfind("```")
+                if end_idx > start_idx:
+                    text = text[start_idx:end_idx].strip()
+                else:
+                    # If no proper end block found, just remove all ``` markers
+                    text = text.replace("```", "").strip()
+            
+            return text
+        except Exception as e:
+            logger.error(f"Error in final paper LLM call: {e}")
+            return "## Error generating comprehensive paper"
+
+    def _convert_markdown_to_pdf(self, markdown_text: str, out_path: Path):
+        """
+        Convert Markdown to PDF using WeasyPrint.
+        """
+        # Convert MD -> HTML with basic styling
+        html_content = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 2em; }}
+                h1 {{ color: #2c3e50; border-bottom: 2px solid #eee; }}
+                h2 {{ color: #34495e; margin-top: 2em; }}
+                h3 {{ color: #7f8c8d; }}
+                code {{ background: #f8f9fa; padding: 0.2em 0.4em; border-radius: 3px; }}
+                pre {{ background: #f8f9fa; padding: 1em; border-radius: 5px; overflow-x: auto; }}
+                blockquote {{ border-left: 4px solid #ddd; margin: 0; padding-left: 1em; color: #666; }}
+                table {{ border-collapse: collapse; width: 100%; margin: 1em 0; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #f8f9fa; }}
+            </style>
+        </head>
+        <body>
+            {markdown.markdown(markdown_text, extensions=['fenced_code', 'tables'])}
+        </body>
+        </html>
+        """
+        
+        # Write to PDF
+        HTML(string=html_content).write_pdf(str(out_path))
+
     def _generate_final_output(self) -> Dict[str, Any]:
         """
-        Generate the final research output.
-        
-        Returns:
-            Research paper and metadata
+        Generate the final research output with both quick summary and comprehensive deep-dive,
+        plus PDF export.
         """
         # Get all content by type
-        search_results = self.current_context.get_content(
-            "main",
-            ContentType.SEARCH_RESULT
-        )
-        explored_content = self.current_context.get_content(
-            "main",
-            ContentType.EXPLORED_CONTENT
-        )
-        analysis = self.current_context.get_content(
-            "main",
-            ContentType.ANALYSIS
-        )
-        
-        # Generate paper sections
-        sections = []
-        
-        # Introduction
-        sections.append(f"# {self.current_context.initial_question}\n")
-        sections.append("## Introduction\n")
-        if search_results:
-            sections.append(search_results[0].content)
-            
-        # Main findings
-        sections.append("\n## Key Findings\n")
-        for result in analysis:
-            if isinstance(result.content, dict):
-                insights = result.content.get("insights", [])
-                for insight in insights:
-                    sections.append(f"- {insight}\n")
-            else:
-                sections.append(f"- {result.content}\n")
-                
-        # Detailed analysis
-        sections.append("\n## Detailed Analysis\n")
-        for content in explored_content:
-            if isinstance(content.content, dict):
-                title = content.content.get("title", "")
-                text = content.content.get("text", "")
-                if title and text:
-                    sections.append(f"\n### {title}\n\n{text}\n")
-            else:
-                sections.append(f"\n{content.content}\n")
-                
+        search_results = self.current_context.get_content("main", ContentType.SEARCH_RESULT)
+        explored_content = self.current_context.get_content("main", ContentType.EXPLORED_CONTENT)
+        analysis = self.current_context.get_content("main", ContentType.ANALYSIS)
+
+        # Generate the comprehensive markdown
+        comprehensive_md = self._generate_comprehensive_paper_markdown(self.current_context)
+
+        # Convert to PDF if we have a research directory
+        if self.research_dir:
+            pdf_path = self.research_dir / "research_paper.pdf"
+            self._convert_markdown_to_pdf(comprehensive_md, pdf_path)
+
+        # Return the final dict with the comprehensive markdown
         return {
-            "paper": "\n".join(sections),
+            "paper": comprehensive_md,
             "title": self.current_context.initial_question,
-            "sources": []
+            "sources": []  # TODO: Extract sources from search results and explored content
         }
         
     def _calculate_metrics(self, total_time: float) -> Dict[str, Any]:
