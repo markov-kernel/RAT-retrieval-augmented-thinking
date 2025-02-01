@@ -1,12 +1,13 @@
 """
 Orchestrator for coordinating the multi-agent research workflow.
-Now fully asynchronous.
+Now fully asynchronous with parallel execution support.
+All decisions are generated solely by O3 mini.
 """
 
 import json
 import time
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 from dataclasses import dataclass
 import asyncio
 from rich import print as rprint
@@ -36,9 +37,65 @@ class ResearchIteration:
     timestamp: float = time.time()
 
 
+@dataclass
+class AgentTask:
+    """
+    Represents a single task to be executed by an agent.
+    Includes the decision, agent reference, and any metadata needed for execution.
+    """
+    decision: ResearchDecision
+    agent: Any
+    priority: float
+    metadata: Dict[str, Any]
+
+    async def execute(self) -> Tuple[ResearchDecision, Optional[Any]]:
+        """Execute the task and return the result along with the original decision."""
+        try:
+            result = await self.agent.execute_decision(self.decision)
+            return self.decision, result
+        except Exception as e:
+            logger.error(f"Error executing task: {str(e)}")
+            return self.decision, None
+
+
+class AgentTaskManager:
+    """
+    Manages the parallel execution of agent tasks with rate limiting and error handling.
+    """
+    def __init__(self, max_concurrent_tasks: int = 10):
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.semaphore = asyncio.Semaphore(max_concurrent_tasks)
+        self.tasks: List[AgentTask] = []
+
+    def add_task(self, task: AgentTask):
+        """Add a task to the execution queue."""
+        self.tasks.append(task)
+
+    async def _execute_task_with_semaphore(self, task: AgentTask) -> Tuple[ResearchDecision, Optional[Any]]:
+        """Execute a single task with semaphore-based concurrency control."""
+        async with self.semaphore:
+            return await task.execute()
+
+    async def execute_all(self) -> List[Tuple[ResearchDecision, Optional[Any]]]:
+        """Execute all tasks in parallel with controlled concurrency."""
+        if not self.tasks:
+            return []
+        self.tasks.sort(key=lambda x: x.priority, reverse=True)
+        coroutines = [self._execute_task_with_semaphore(task) for task in self.tasks]
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        valid_results = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Task execution failed: {str(result)}")
+            elif result[1] is not None:
+                valid_results.append(result)
+        return valid_results
+
+
 class ResearchOrchestrator:
     """
     Coordinates the multi-agent research workflow.
+    All decision making is delegated to O3 mini.
     """
     def __init__(self, config: Optional[Dict[str, Any]] = None):
         self.config = config or {}
@@ -98,52 +155,57 @@ class ResearchOrchestrator:
 
     async def _run_iteration(self, iteration_number: int) -> ResearchIteration:
         iteration_start = time.time()
-        all_decisions = []
+        decisions = []
         content_added = []
         try:
-            reason_decisions = await self.reason_agent.analyze(self.current_context)
-            if any(d.decision_type == DecisionType.TERMINATE for d in reason_decisions):
-                all_decisions.extend(reason_decisions)
-            else:
-                search_decisions = await self.search_agent.analyze(self.current_context)
-                explore_decisions = await self.explore_agent.analyze(self.current_context)
-                all_decisions = reason_decisions + search_decisions + explore_decisions
-            sorted_decisions = sorted(all_decisions, key=lambda d: d.priority, reverse=True)
-            for decision in sorted_decisions:
+            # All decisions are generated exclusively by the ReasoningAgent.
+            decisions = await self.reason_agent.analyze(self.current_context)
+            if any(d.decision_type == DecisionType.TERMINATE for d in decisions):
+                return self._create_iteration_result(
+                    iteration_number, decisions, content_added, time.time() - iteration_start
+                )
+            task_manager = AgentTaskManager(
+                max_concurrent_tasks=self.config.get("max_concurrent_tasks", 10)
+            )
+            for decision in sorted(decisions, key=lambda d: d.priority, reverse=True):
                 if decision.decision_type == DecisionType.TERMINATE:
-                    break
-                agent = self._get_agent_for_decision(decision)
-                if not agent:
                     continue
+                # Skip duplicate searches.
                 if decision.decision_type == DecisionType.SEARCH:
                     query_str = decision.context.get("query", "").strip()
-                    if not query_str:
-                        continue
-                    if query_str in self.previous_searches:
+                    if not query_str or query_str in self.previous_searches:
                         rprint(f"[yellow]Skipping duplicate search: '{query_str}'[/yellow]")
                         continue
-                    else:
-                        self.previous_searches.add(query_str)
-                try:
-                    result = await agent.execute_decision(decision)
-                    if result:
-                        content_item = self._create_content_item(decision, result, iteration_number)
-                        self.current_context.add_content("main", content_item=content_item)
-                        content_added.append(content_item)
-                except Exception as e:
-                    rprint(f"[red]Error executing decision: {str(e)}[/red]")
+                    self.previous_searches.add(query_str)
+                task = AgentTask(decision, self._get_agent_for_decision(decision), {"iteration": iteration_number})
+                task_manager.add_task(task)
+            results = await task_manager.execute_all()
+            for decision, result in results:
+                if result:
+                    content_item = self._create_content_item(decision, result, iteration_number)
+                    self.current_context.add_content("main", content_item=content_item)
+                    content_added.append(content_item)
         except Exception as e:
             rprint(f"[red]Iteration error: {str(e)}[/red]")
+            logger.error(f"Iteration error: {str(e)}", exc_info=True)
+        return self._create_iteration_result(
+            iteration_number, decisions, content_added, time.time() - iteration_start
+        )
+
+    def _create_iteration_result(
+        self, iteration_number: int, decisions: List[ResearchDecision],
+        content: List[ContentItem], iteration_time: float
+    ) -> ResearchIteration:
         metrics = {
-            "iteration_time": time.time() - iteration_start,
-            "decisions_made": len(all_decisions),
-            "content_added": len(content_added),
+            "iteration_time": iteration_time,
+            "decisions_made": len(decisions),
+            "content_added": len(content),
             "agent_metrics": self._get_agent_metrics()
         }
         return ResearchIteration(
             iteration_number=iteration_number,
-            decisions_made=all_decisions,
-            content_added=content_added,
+            decisions_made=decisions,
+            content_added=content,
             metrics=metrics
         )
 
@@ -153,7 +215,7 @@ class ResearchOrchestrator:
             urls = result.get('urls', [])
             token_count = self.current_context._estimate_tokens(content_str)
             return ContentItem(
-                content_type=self._get_content_type(decision),
+                content_type=ContentType.SEARCH_RESULT,
                 content=content_str,
                 metadata={"decision_type": decision.decision_type.value, "iteration": iteration_number, "urls": urls},
                 token_count=token_count,
@@ -162,8 +224,10 @@ class ResearchOrchestrator:
         else:
             content_str = result if isinstance(result, str) else json.dumps(result)
             token_count = self.current_context._estimate_tokens(content_str)
+            content_type = (ContentType.EXPLORED_CONTENT if decision.decision_type == DecisionType.EXPLORE 
+                            else ContentType.ANALYSIS)
             return ContentItem(
-                content_type=self._get_content_type(decision),
+                content_type=content_type,
                 content=result,
                 metadata={"decision_type": decision.decision_type.value, "iteration": iteration_number},
                 token_count=token_count,
@@ -171,26 +235,13 @@ class ResearchOrchestrator:
             )
 
     def _should_terminate(self, iteration: ResearchIteration) -> bool:
-        terminate_decision = any(d.decision_type == DecisionType.TERMINATE for d in iteration.decisions_made)
-        if terminate_decision:
-            rprint("[green]Terminating: ReasoningAgent indicated completion.[/green]")
-            return True
+        # We decide termination solely by querying O3 mini.
         try:
-            reason_decisions = asyncio.run(self.reason_agent.analyze(self.current_context))
-            search_decisions = asyncio.run(self.search_agent.analyze(self.current_context))
-            explore_decisions = asyncio.run(self.explore_agent.analyze(self.current_context))
-            valid_decisions = [
-                d for d in (reason_decisions + search_decisions + explore_decisions)
-                if (d.decision_type != DecisionType.SEARCH or 
-                    d.context.get("query", "").strip() not in self.previous_searches)
-            ]
-            if not valid_decisions:
-                rprint("[yellow]Terminating: No further valid decisions from any agent.[/yellow]")
-                return True
+            # Since _should_terminate is a synchronous check here, we call the ReasoningAgent method synchronously.
+            return asyncio.run(self.reason_agent._should_terminate(self.current_context))
         except Exception as e:
-            rprint(f"[red]Error checking for new decisions: {str(e)}[/red]")
+            rprint(f"[red]Error checking termination: {str(e)}[/red]")
             return False
-        return False
 
     def _get_agent_for_decision(self, decision: ResearchDecision) -> Optional[Any]:
         agent_map = {
@@ -199,15 +250,6 @@ class ResearchOrchestrator:
             DecisionType.REASON: self.reason_agent
         }
         return agent_map.get(decision.decision_type)
-
-    def _get_content_type(self, decision: ResearchDecision) -> ContentType:
-        type_map = {
-            DecisionType.SEARCH: ContentType.SEARCH_RESULT,
-            DecisionType.EXPLORE: ContentType.EXPLORED_CONTENT,
-            DecisionType.REASON: ContentType.ANALYSIS,
-            DecisionType.TERMINATE: ContentType.OTHER
-        }
-        return type_map.get(decision.decision_type, ContentType.OTHER)
 
     async def _call_o3_mini_for_report(self, prompt: str) -> str:
         try:

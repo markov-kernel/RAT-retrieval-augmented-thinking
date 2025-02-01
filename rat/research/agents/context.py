@@ -88,6 +88,7 @@ class ResearchContext:
         self.branches: Dict[str, ContextBranch] = {"main": self.main_branch}
         self.merged_branches: Set[str] = set()
         self.version = 0
+        self.last_update_time = time.time()
     
     def create_branch(self, parent_branch_id: str = "main") -> ContextBranch:
         """
@@ -169,6 +170,7 @@ class ResearchContext:
             
         branch.content_items.append(item)
         branch.token_count += token_usage
+        self.last_update_time = time.time()
         
         return item
     

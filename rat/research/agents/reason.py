@@ -1,23 +1,26 @@
 """
 Reasoning agent for analyzing research content using the o3-mini model with high reasoning effort.
-Now acts as the "lead agent" that decides next steps.
-All methods are now asynchronous.
+All decisions are now generated solely by O3 mini.
+All next–step decisions are derived from a structured JSON response.
+All local heuristics or NLP rules have been removed.
 """
 
 import asyncio
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 import time
 from rich import print as rprint
 import logging
 import json
-import re
 from urllib.parse import urlparse
 import openai
 from openai import OpenAI
+import uuid
 
 from .base import BaseAgent, ResearchDecision, DecisionType
 from .context import ResearchContext, ContentType, ContentItem
+from ..circuit_breaker import CircuitBreaker
+from ..monitoring import MetricsManager
 
 logger = logging.getLogger(__name__)
 api_logger = logging.getLogger('api.o3mini')
@@ -34,7 +37,9 @@ class AnalysisTask:
 
 class ReasoningAgent(BaseAgent):
     """
-    Reasoning agent for analyzing research content.
+    Reasoning agent that uses O3 mini exclusively to decide the next research steps.
+    It aggregates the current research context and sends it to O3 mini to obtain a JSON array
+    of decisions. No local heuristics or fixed rules are applied.
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -43,16 +48,29 @@ class ReasoningAgent(BaseAgent):
         self.max_output_tokens = self.config.get("max_output_tokens", 50000)
         self.request_timeout = self.config.get("o3_mini_timeout", 180)
         self.reasoning_effort = "high"
-        self.chunk_margin = 5000
         self.max_parallel_tasks = self.config.get("max_parallel_tasks", 3)
-        self.min_priority = self.config.get("min_priority", 0.3)
-        self.min_url_relevance = self.config.get("min_url_relevance", 0.6)
-        self.explored_urls: Set[str] = set()
         self.flash_fix_rate_limit = self.config.get("flash_fix_rate_limit", 10)
         self._flash_fix_last_time = 0.0
         self._flash_fix_lock = asyncio.Lock()
-        logger.info("ReasoningAgent initialized to use o3-mini model: %s", self.model_name)
-        self.analysis_tasks: Dict[str, AnalysisTask] = {}
+        self.session_id = str(uuid.uuid4())
+        self.metrics = MetricsManager().get_metrics(self.session_id)
+        
+        # Initialize circuit breakers
+        self.analysis_circuit = CircuitBreaker(
+            name="o3mini_analysis",
+            failure_threshold=self.config.get("circuit_failure_threshold", 5),
+            reset_timeout=self.config.get("circuit_reset_timeout", 60.0),
+            session_id=self.session_id
+        )
+        self.decision_circuit = CircuitBreaker(
+            name="o3mini_decisions",
+            failure_threshold=self.config.get("circuit_failure_threshold", 5),
+            reset_timeout=self.config.get("circuit_reset_timeout", 60.0),
+            session_id=self.session_id
+        )
+        
+        logger.info(f"ReasoningAgent initialized with session {self.session_id}")
+        self.analysis_tasks = {}
 
     async def _enforce_flash_fix_limit(self):
         if self.flash_fix_rate_limit <= 0:
@@ -63,7 +81,11 @@ class ReasoningAgent(BaseAgent):
             min_interval = 60.0 / self.flash_fix_rate_limit
             if elapsed < min_interval:
                 await asyncio.sleep(min_interval - elapsed)
-                self.metrics["rate_limit_delays"] += 1
+                self.metrics.record_api_call(
+                    success=True,
+                    latency=min_interval - elapsed,
+                    metadata={"type": "rate_limit_delay"}
+                )
             self._flash_fix_last_time = asyncio.get_event_loop().time()
 
     async def _call_o3_mini(self, prompt: str, context: str = "") -> str:
@@ -72,10 +94,9 @@ class ReasoningAgent(BaseAgent):
             messages.append({"role": "assistant", "content": context})
         messages.append({"role": "user", "content": prompt})
         api_logger.info(f"o3-mini API Request - Prompt length: {len(prompt)}")
-        try:
-            # Enforce rate limit before making the API call
-            await self._enforce_rate_limit()
-
+        
+        async def _make_api_call():
+            await self._enforce_flash_fix_limit()
             client = OpenAI()
             response = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -86,162 +107,146 @@ class ReasoningAgent(BaseAgent):
                 **({"response_format": {"type": "json_object"}} if "json" in prompt.lower() else {})
             )
             return response.choices[0].message.content
+        
+        try:
+            # Use circuit breaker for API calls
+            result = await self.analysis_circuit.execute(_make_api_call)
+            return result
         except Exception as e:
             api_logger.error(f"o3-mini API error: {str(e)}")
+            self.metrics.record_error(
+                error_type="api_error",
+                error_message=str(e),
+                metadata={"model": self.model_name}
+            )
             raise
 
     async def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
-        decisions = []
-        search_results = context.get_content("main", ContentType.SEARCH_RESULT)
-        if not search_results:
-            decisions.append(
-                ResearchDecision(
-                    decision_type=DecisionType.SEARCH,
-                    priority=1.0,
-                    context={
-                        "query": context.initial_question,
-                        "rationale": "Initial broad search for the research question"
-                    },
-                    rationale="Starting research with a broad search query"
-                )
-            )
-            return decisions
-
-        explored_content = context.get_content("main", ContentType.EXPLORED_CONTENT)
-        explored_urls = { 
-            item.content.get("url", "") for item in explored_content
-            if isinstance(item.content, dict)
-        }
-        self.explored_urls.update(explored_urls)
-        unvisited_urls = set()
-        for result in search_results:
-            if isinstance(result.content, dict):
-                urls = result.content.get("urls", [])
-                unvisited_urls.update(url for url in urls if url not in self.explored_urls)
-        relevant_urls = await self._filter_relevant_urls(list(unvisited_urls), context)
-        for url, relevance in relevant_urls:
-            if relevance >= self.min_url_relevance:
-                decisions.append(
-                    ResearchDecision(
-                        decision_type=DecisionType.EXPLORE,
-                        priority=relevance,
-                        context={
-                            "url": url,
-                            "relevance": relevance,
-                            "rationale": "URL deemed relevant to research question"
-                        },
-                        rationale=f"URL relevance score: {relevance:.2f}"
-                    )
-                )
-        unprocessed_search = [item for item in search_results if not item.metadata.get("analyzed_by_reasoner")]
-        unprocessed_explored = [item for item in explored_content if not item.metadata.get("analyzed_by_reasoner")]
-        for item in unprocessed_search + unprocessed_explored:
-            if item.priority < self.min_priority:
-                continue
-            decisions.append(
-                ResearchDecision(
-                    decision_type=DecisionType.REASON,
-                    priority=0.9,
-                    context={
-                        "content": item.content,
-                        "content_type": item.content_type.value,
-                        "item_id": item.id
-                    },
-                    rationale=f"Analyze new {item.content_type.value} content"
-                )
-            )
-        search_text = "\n".join(str(item.content) for item in search_results if isinstance(item.content, str))
-        explored_text = "\n".join(str(item.content) for item in explored_content if isinstance(item.content, str))
-        analysis_items = context.get_content("main", ContentType.ANALYSIS)
-        analysis_text = "\n".join(
-            (item.content.get("analysis", "") if isinstance(item.content, dict) else str(item.content))
-            for item in analysis_items
+        # Aggregate the current research context.
+        aggregated_text = ""
+        for content_item in context.get_content("main"):
+            aggregated_text += f"\n[{content_item.content_type.value}] {content_item.content}\n"
+        
+        prompt = (
+            "You are an advanced research assistant. Given the research question and the following aggregated research content, "
+            "generate a JSON array of decisions for the next steps in the research process. Each decision must be an object with the following keys:\n"
+            " - decision_type: one of 'search', 'explore', 'reason', or 'terminate'\n"
+            " - priority: a number between 0 and 1 indicating the importance of the decision\n"
+            " - context: an object containing necessary parameters (for example, for a search decision, include a 'query' field; for an explore decision, include a 'url' field)\n"
+            " - rationale: a brief explanation for the decision\n\n"
+            "The research question is: \"" + context.initial_question + "\"\n\n"
+            "The aggregated research content is:\n" + aggregated_text + "\n\n"
+            "Return only the JSON array, with no additional text."
         )
-        combined_analysis = f"{search_text}\n\n{explored_text}\n\n{analysis_text}".strip()
-        if combined_analysis:
-            gaps = await self._identify_knowledge_gaps(context.initial_question, combined_analysis)
-            filtered_gaps = []
-            for gap in gaps:
-                query_str = gap.get("query", "")
-                url_str = gap.get("url", "")
-                if any(x in query_str or x in url_str for x in ("[", "]")):
-                    self.logger.warning(f"Skipping gap with placeholders: {gap}")
-                    continue
-                filtered_gaps.append(gap)
-            for gap in filtered_gaps:
-                if gap["type"] == "search":
-                    decisions.append(
-                        ResearchDecision(
-                            decision_type=DecisionType.SEARCH,
-                            priority=0.8,
-                            context={
-                                "query": gap["query"],
-                                "rationale": gap["rationale"]
-                            },
-                            rationale=f"Fill knowledge gap: {gap['rationale']}"
-                        )
+        
+        try:
+            # Use circuit breaker for decision generation
+            response = await self.decision_circuit.execute(self._call_o3_mini, prompt)
+            try:
+                decisions_json = json.loads(response)
+                if not isinstance(decisions_json, list):
+                    logger.warning("O3 mini response is not a list of decisions")
+                    return []
+                decisions = []
+                for d in decisions_json:
+                    if not isinstance(d, dict):
+                        continue
+                    decision_type_str = d.get("decision_type", "").lower()
+                    if decision_type_str not in [dt.value for dt in DecisionType]:
+                        continue
+                    decision = ResearchDecision(
+                        decision_type=DecisionType(decision_type_str),
+                        priority=float(d.get("priority", 0.5)),
+                        context=d.get("context", {}),
+                        rationale=d.get("rationale", "")
                     )
-                elif gap["type"] == "explore":
-                    if gap["url"] not in self.explored_urls:
-                        decisions.append(
-                            ResearchDecision(
-                                decision_type=DecisionType.EXPLORE,
-                                priority=0.75,
-                                context={
-                                    "url": gap["url"],
-                                    "rationale": gap["rationale"]
-                                },
-                                rationale=f"Explore URL for more details: {gap['rationale']}"
-                            )
-                        )
-        else:
-            self.logger.info("Skipping knowledge gap analysis due to lack of context.")
-        if await self._should_terminate(context):
-            decisions.append(
-                ResearchDecision(
-                    decision_type=DecisionType.TERMINATE,
-                    priority=1.0,
-                    context={},
-                    rationale="Research question appears to be sufficiently answered"
-                )
+                    decisions.append(decision)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse O3 mini response as JSON: {str(e)}")
+                return []
+            except Exception as e:
+                logger.error(f"Error parsing decisions from O3 mini response: {str(e)}")
+                return []
+            
+            # Record metrics
+            self.metrics.record_decision(
+                success=True,
+                execution_time=time.time() - time.time(),  # Just use current time difference since we don't have last_update_time
+                metadata={
+                    "decisions_count": len(decisions),
+                    "question": context.initial_question
+                }
             )
-        return decisions
+            
+            return decisions
+            
+        except Exception as e:
+            self.logger.error(f"Error parsing decisions from O3 mini response: {str(e)}")
+            self.metrics.record_decision(
+                success=False,
+                execution_time=time.time() - context.last_update_time,
+                metadata={"error": str(e)}
+            )
+            return []
 
     def can_handle(self, decision: ResearchDecision) -> bool:
         return decision.decision_type == DecisionType.REASON
 
     async def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
-        start_time = asyncio.get_event_loop().time()
+        start_time = time.time()
         success = False
         results = {}
         try:
-            content = decision.context["content"]
-            content_type = decision.context["content_type"]
-            item_id = decision.context["item_id"]
+            # For a reason decision, we expect a 'content' field in the context.
+            content = decision.context.get("content", "")
+            content_type = decision.context.get("content_type", "unknown")
+            item_id = decision.context.get("item_id", "")
             content_str = str(content)
             tokens_estimated = len(content_str) // 4
+            
             if tokens_estimated > self.max_output_tokens:
                 chunk_results = await self._parallel_analyze_content(content_str, content_type)
                 results = self._combine_chunk_results(chunk_results)
             else:
                 results = await self._analyze_content_chunk(content_str, content_type)
+            
             success = bool(results.get("analysis", "").strip())
             decision.context["analyzed_by_reasoner"] = True
+            
             final_results = {
                 "analysis": results.get("analysis", ""),
                 "insights": results.get("insights", []),
                 "analyzed_item_id": item_id
             }
+            
             if success:
                 rprint(f"[green]ReasoningAgent: Analysis completed for content type '{content_type}'[/green]")
             else:
                 rprint(f"[yellow]ReasoningAgent: No analysis produced for '{content_type}'[/yellow]")
+            
+            # Record metrics
+            execution_time = time.time() - start_time
+            self.metrics.record_decision(
+                success=success,
+                execution_time=execution_time,
+                metadata={
+                    "content_type": content_type,
+                    "tokens": tokens_estimated
+                }
+            )
+            
             return final_results
+            
         except Exception as e:
             rprint(f"[red]ReasoningAgent error: {str(e)}[/red]")
+            self.metrics.record_error(
+                error_type="execution_error",
+                error_message=str(e),
+                metadata={"decision_type": "reason"}
+            )
             return {"error": str(e), "analysis": "", "insights": []}
         finally:
-            execution_time = asyncio.get_event_loop().time() - start_time
+            execution_time = time.time() - start_time
             self.log_decision(decision, success, execution_time)
 
     async def _parallel_analyze_content(self, content: str, content_type: str) -> List[Dict[str, Any]]:
@@ -270,19 +275,40 @@ class ReasoningAgent(BaseAgent):
             f"CONTENT:\n{content}\n\n"
             "Please provide your analysis below (plain text only):"
         )
-        response_text = await self._call_o3_mini(prompt)
-        analysis_text = response_text.strip()
-        insights = self._extract_insights(analysis_text)
-        return {"analysis": analysis_text, "insights": insights}
+        
+        try:
+            # Use circuit breaker for content analysis
+            response_text = await self.analysis_circuit.execute(self._call_o3_mini, prompt)
+            analysis_text = response_text.strip()
+            insights = self._extract_insights(analysis_text)
+            
+            # Record successful analysis
+            self.metrics.record_api_call(
+                success=True,
+                latency=time.time() - self._flash_fix_last_time,
+                metadata={
+                    "content_type": content_type,
+                    "insights_count": len(insights)
+                }
+            )
+            
+            return {"analysis": analysis_text, "insights": insights}
+            
+        except Exception as e:
+            self.metrics.record_error(
+                error_type="analysis_error",
+                error_message=str(e),
+                metadata={"content_type": content_type}
+            )
+            return {"analysis": "", "insights": []}
 
     def _extract_insights(self, analysis_text: str) -> List[str]:
         lines = analysis_text.split("\n")
         insights = []
         for line in lines:
             line = line.strip()
-            if (line.startswith("-") or line.startswith("*") or line.startswith("•") or 
-                (len(line) > 2 and line[:2].isdigit())):
-                insights.append(line.lstrip("-*•").strip())
+            if line:
+                insights.append(line)
         return insights
 
     def _combine_chunk_results(self, chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -294,129 +320,33 @@ class ReasoningAgent(BaseAgent):
         unique_insights = list(dict.fromkeys(combined_insights))
         return {"analysis": combined_analysis, "insights": unique_insights, "chunk_count": len(chunk_results)}
 
-    async def _identify_knowledge_gaps(self, question: str, current_analysis: str) -> List[Dict[str, Any]]:
-        prompt = (
-            "You are an advanced research assistant. Given a research question and current analysis, "
-            "identify specific missing information and suggest concrete next steps.\n\n"
-            "IMPORTANT RULES:\n"
-            "1. DO NOT use placeholders like [company name] or [person].\n"
-            "2. Base suggestions solely on the provided content.\n"
-            "3. If no specific gaps can be identified, return an empty array.\n"
-            "4. Each suggestion must be actionable and clearly linked to the research question.\n\n"
-            f"RESEARCH QUESTION: {question}\n\n"
-            f"CURRENT ANALYSIS:\n{current_analysis}\n\n"
-            "Return a JSON object with a 'gaps' array in this format:\n"
-            "{\"gaps\": [{\"type\": \"search\"|\"explore\", \"query\"|\"url\": \"specific text\", \"rationale\": \"why needed\"}]}"
-        )
-        try:
-            response = await self._call_o3_mini(prompt)
-            content_str = response.strip()
-            if not content_str:
-                return []
-            try:
-                result = json.loads(content_str)
-                gaps = result.get("gaps", [])
-                filtered_gaps = []
-                for gap in gaps:
-                    if not isinstance(gap, dict):
-                        continue
-                    if "type" not in gap or gap["type"] not in ["search", "explore"]:
-                        continue
-                    content_field = "query" if gap["type"] == "search" else "url"
-                    if content_field not in gap or "rationale" not in gap:
-                        continue
-                    if any(x in gap[content_field] or x in gap["rationale"] for x in ("[", "]")):
-                        self.logger.warning(f"Skipping gap with placeholders: {gap}")
-                        continue
-                    filtered_gaps.append(gap)
-                return filtered_gaps
-            except json.JSONDecodeError:
-                self.logger.error("Failed to parse knowledge gaps JSON response")
-                return []
-        except Exception as e:
-            self.logger.error(f"Error identifying knowledge gaps: {str(e)}")
-            return []
-
-    def _clean_json_response(self, content: str) -> str:
-        content = content.strip()
-        if content.startswith("```"):
-            start_idx = content.find("\n") + 1
-            end_idx = content.rfind("```")
-            if end_idx > start_idx:
-                content = content[start_idx:end_idx].strip()
-            else:
-                content = content.replace("```", "").strip()
-        content = content.replace("json", "").strip()
-        return content
-
     async def _should_terminate(self, context: ResearchContext) -> bool:
-        analysis_items = context.get_content("main", ContentType.ANALYSIS)
-        if len(analysis_items) < 3:
-            return False
-        combined_analysis = "\n".join(
-            str(item.content.get("analysis", "")) for item in analysis_items if isinstance(item.content, dict)
-        )
         prompt = (
-            "You are an advanced research assistant. Given a research question and current analysis, "
-            "determine if the question has been sufficiently answered.\n\n"
-            f"QUESTION: {context.initial_question}\n\n"
-            f"CURRENT ANALYSIS:\n{combined_analysis}\n\n"
-            "Respond with a single word: YES if answered, NO if not."
+            "You are an advanced research assistant. Given the research question and the aggregated research content below, "
+            "determine if the research question has been sufficiently answered. Respond with a single word: YES if it is answered, NO if it is not.\n\n"
+            f"Research Question: {context.initial_question}\n\n"
+            "Aggregated Research Content:\n" +
+            "\n".join(str(item.content) for item in context.get_content("main"))
         )
         try:
-            answer = await self._call_o3_mini(prompt, combined_analysis)
-            return answer.strip().upper() == "YES"
-        except Exception:
+            # Use circuit breaker for termination check
+            answer = await self.decision_circuit.execute(self._call_o3_mini, prompt)
+            result = answer.strip().upper() == "YES"
+            
+            # Record the termination decision
+            self.metrics.record_decision(
+                success=True,
+                execution_time=0.0,
+                metadata={
+                    "decision_type": "terminate",
+                    "result": result
+                }
+            )
+            
+            return result
+        except Exception as e:
+            self.metrics.record_error(
+                error_type="termination_error",
+                error_message=str(e)
+            )
             return False
-
-    async def _filter_relevant_urls(self, urls: List[str], context: ResearchContext) -> List[tuple]:
-        if not urls:
-            return []
-        batch_size = 5
-        url_batches = [urls[i:i + batch_size] for i in range(0, len(urls), batch_size)]
-        relevant_urls = []
-        for batch in url_batches:
-            prompt = (
-                "You are an expert at determining URL relevance for research questions.\n"
-                "For each URL, analyze its potential relevance to the research question "
-                "and provide a relevance score between 0.0 and 1.0.\n\n"
-                f"RESEARCH QUESTION: {context.initial_question}\n\n"
-                "URLs to evaluate:\n"
-            )
-            for url in batch:
-                domain = urlparse(url).netloc
-                path = urlparse(url).path
-                prompt += f"- {domain}{path}\n"
-            prompt += (
-                "\nRespond with a JSON array of scores in this format:\n"
-                "[{\"url\": \"...\", \"score\": 0.X, \"reason\": \"...\"}]\n"
-                "ONLY return the JSON array, no other text."
-            )
-            try:
-                content = await self._call_o3_mini(prompt)
-                if content.startswith("```"):
-                    content = content[content.find("\n")+1:content.rfind("```")].strip()
-                content = content.replace("json", "").strip()
-                scores = json.loads(content)
-                for score_obj in scores:
-                    url = score_obj["url"]
-                    score = float(score_obj["score"])
-                    relevant_urls.append((url, score))
-            except Exception as e:
-                logger.error(f"Error scoring URLs: {str(e)}")
-                for url in batch:
-                    relevance = self._basic_url_relevance(url, context.initial_question)
-                    relevant_urls.append((url, relevance))
-        return sorted(relevant_urls, key=lambda x: x[1], reverse=True)
-
-    def _basic_url_relevance(self, url: str, question: str) -> float:
-        import re
-        from urllib.parse import urlparse
-        keywords = set(re.findall(r'\w+', question.lower()))
-        parsed = urlparse(url)
-        domain_parts = parsed.netloc.lower().split('.')
-        path_parts = parsed.path.lower().split('/')
-        domain_matches = sum(1 for part in domain_parts if part in keywords)
-        path_matches = sum(1 for part in path_parts if part in keywords)
-        score = (domain_matches * 0.6 + path_matches * 0.4) / max(len(keywords), 1)
-        return min(max(score, 0.0), 1.0)

@@ -87,7 +87,11 @@ This async version uses asyncio locks and awaits where appropriate.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .context import ResearchContext
+
 from enum import Enum
 from rich import print as rprint
 import asyncio
@@ -97,11 +101,69 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class TokenBucket:
+    """
+    Implements the token bucket algorithm for rate limiting.
+    Provides a more flexible and efficient way to control API request rates.
+    """
+    def __init__(self, rate_limit: float, burst_limit: Optional[float] = None):
+        """
+        Initialize the token bucket.
+        
+        Args:
+            rate_limit: Number of tokens per minute
+            burst_limit: Maximum number of tokens that can be accumulated (defaults to rate_limit)
+        """
+        self.rate_limit = float(rate_limit)
+        self.burst_limit = float(burst_limit if burst_limit is not None else rate_limit)
+        self.tokens = self.burst_limit
+        self.last_update = asyncio.get_event_loop().time()
+        self._lock = asyncio.Lock()
+        
+    async def acquire(self, tokens: float = 1.0) -> float:
+        """
+        Acquire tokens from the bucket. Returns the wait time if tokens aren't available.
+        
+        Args:
+            tokens: Number of tokens to acquire (default: 1.0)
+            
+        Returns:
+            Float: Time to wait in seconds (0 if tokens are available immediately)
+        """
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            time_passed = now - self.last_update
+            self.tokens = min(
+                self.burst_limit,
+                self.tokens + time_passed * (self.rate_limit / 60.0)
+            )
+            self.last_update = now
+            
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                return 0.0
+            else:
+                wait_time = (tokens - self.tokens) * 60.0 / self.rate_limit
+                self.tokens = 0
+                return wait_time
+
+    async def try_acquire(self, tokens: float = 1.0) -> bool:
+        """
+        Try to acquire tokens without waiting.
+        
+        Returns:
+            bool: True if tokens were acquired, False otherwise
+        """
+        wait_time = await self.acquire(tokens)
+        return wait_time == 0.0
+
+
 class DecisionType(Enum):
     """Types of decisions an agent can make during research."""
     SEARCH = "search"      # New search query needed
     EXPLORE = "explore"    # URL exploration needed
     REASON = "reason"      # Deep analysis needed (using Gemini now)
+    EXECUTE = "execute"     # Execution of a decision
     TERMINATE = "terminate"  # Research complete or no further steps
 
 
@@ -129,7 +191,7 @@ class ResearchDecision:
 class BaseAgent(ABC):
     """
     Base class for all research agents.
-    All methods are now asynchronous.
+    All methods are now asynchronous with improved rate limiting.
     """
 
     def __init__(self, name: str, config: Optional[Dict[str, Any]] = None):
@@ -144,32 +206,36 @@ class BaseAgent(ABC):
             "parallel_executions": 0,
             "max_concurrent_tasks": 0,
             "rate_limit_delays": 0,
-            "retry_attempts": 0
+            "retry_attempts": 0,
+            "tokens_consumed": 0.0
         }
         self.max_workers = self.config.get("max_workers", 5)
         self.rate_limit = self.config.get("rate_limit", 100)
+        self.burst_limit = self.config.get("burst_limit", self.rate_limit * 1.5)
         self._active_tasks: Set[str] = set()
         self._tasks_lock = asyncio.Lock()
-        self._last_request_time = 0.0
-        self._rate_limit_lock = asyncio.Lock()
+        self._token_bucket = TokenBucket(self.rate_limit, self.burst_limit)
         self.logger = logging.getLogger(f"{__name__}.{name}")
 
-    async def _enforce_rate_limit(self):
+    async def _enforce_rate_limit(self, tokens: float = 1.0) -> None:
         """
-        Ensure we do not exceed self.rate_limit requests per minute.
-        Uses an asynchronous lock and sleep.
+        Enforce rate limiting using the token bucket algorithm.
+        More sophisticated than the previous implementation, allowing for bursts
+        while still maintaining average rate limits.
+        
+        Args:
+            tokens: Number of tokens to consume (default: 1.0)
         """
         if self.rate_limit <= 0:
-            return  # no limiting
-        async with self._rate_limit_lock:
-            current_time = asyncio.get_event_loop().time()
-            elapsed = current_time - self._last_request_time
-            min_interval = 60.0 / self.rate_limit
-            if elapsed < min_interval:
-                sleep_time = min_interval - elapsed
-                await asyncio.sleep(sleep_time)
-                self.metrics["rate_limit_delays"] += 1
-            self._last_request_time = asyncio.get_event_loop().time()
+            return
+
+        wait_time = await self._token_bucket.acquire(tokens)
+        if wait_time > 0:
+            self.metrics["rate_limit_delays"] += 1
+            self.logger.debug(f"Rate limit enforced, waiting {wait_time:.2f}s")
+            await asyncio.sleep(wait_time)
+        
+        self.metrics["tokens_consumed"] += tokens
 
     @abstractmethod
     async def analyze(self, context: 'ResearchContext') -> List[ResearchDecision]:
@@ -556,6 +622,7 @@ Now acts as a simple executor that processes EXPLORE decisions.
 from typing import List, Dict, Any, Optional
 import logging
 from rich import print as rprint
+import asyncio
 
 from .base import BaseAgent, ResearchDecision, DecisionType
 from .context import ResearchContext, ContentType
@@ -625,6 +692,7 @@ import logging
 import json
 import re
 from urllib.parse import urlparse
+import openai
 from openai import OpenAI
 
 from .base import BaseAgent, ResearchDecision, DecisionType
@@ -684,19 +752,19 @@ class ReasoningAgent(BaseAgent):
         messages.append({"role": "user", "content": prompt})
         api_logger.info(f"o3-mini API Request - Prompt length: {len(prompt)}")
         try:
-            # Use the new OpenAI API format
+            # Enforce rate limit before making the API call
+            await self._enforce_rate_limit()
+
             client = OpenAI()
-            params = {
-                "model": self.model_name,
-                "messages": messages,
-                "reasoning_effort": self.reasoning_effort,
-                "max_completion_tokens": self.max_output_tokens,
-            }
-            if "JSON" in prompt or "json" in prompt:
-                params["response_format"] = {"type": "json_object"}
-            response = client.chat.completions.create(**params)
-            text = response.choices[0].message.content.strip()
-            return text
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=self.model_name,
+                messages=messages,
+                reasoning_effort=self.reasoning_effort,
+                max_completion_tokens=self.max_output_tokens,
+                **({"response_format": {"type": "json_object"}} if "json" in prompt.lower() else {})
+            )
+            return response.choices[0].message.content
         except Exception as e:
             api_logger.error(f"o3-mini API error: {str(e)}")
             raise
@@ -1046,6 +1114,7 @@ from dataclasses import dataclass
 import time
 from rich import print as rprint
 import logging
+import asyncio
 
 from ..perplexity_client import PerplexityClient
 from .base import BaseAgent, ResearchDecision, DecisionType
@@ -1412,17 +1481,21 @@ if __name__ == '__main__':
 ```python
 """
 Manager for coordinating the multi-agent research workflow.
-Now fully asynchronous.
+This module implements a central ResearchManager that:
+  - Initializes a ResearchContext and persists it to a JSON file.
+  - Dispatches agent decisions as concurrent tasks (using AgentTask wrappers).
+  - Updates the context as agent tasks complete.
+  - Generates a comprehensive research paper upon termination.
 """
 
 import json
 import time
 import logging
-from asyncio import gather, create_task
+import asyncio
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-import asyncio
 from openai import OpenAI
+from rich import print as rprint
 
 from rat.research.agents.search import SearchAgent
 from rat.research.agents.explore import ExploreAgent
@@ -1439,6 +1512,8 @@ logger = logging.getLogger(__name__)
 class AgentTask:
     """
     Wrapper for an agent decision execution.
+    Executes the decision via the appropriate agent and calls a callback
+    to update the research context.
     """
     def __init__(self, decision: ResearchDecision, agent, callback):
         self.decision = decision
@@ -1446,9 +1521,14 @@ class AgentTask:
         self.callback = callback
 
     async def run(self):
-        result = await self.agent.execute_decision(self.decision)
-        self.callback(self.decision, result)
-        return result
+        """Execute the decision asynchronously."""
+        try:
+            result = await self.agent.execute_decision(self.decision)
+            self.callback(self.decision, result)
+            return result
+        except Exception as e:
+            logger.error(f"Error executing decision: {str(e)}")
+            return {"error": str(e)}
 
 
 class ResearchManager:
@@ -1477,7 +1557,7 @@ class ResearchManager:
         while iteration < self.max_iterations:
             iteration += 1
             logger.info(f"Starting iteration {iteration}")
-            decisions = self.collect_decisions()
+            decisions = await self.collect_decisions()
             if not decisions:
                 logger.info("No new decisions, terminating research")
                 break
@@ -1486,7 +1566,7 @@ class ResearchManager:
                 break
             await self.dispatch_decisions(decisions, iteration)
             self.persist_context()
-            if self._should_terminate():
+            if await self._should_terminate():
                 logger.info("Termination condition met based on context")
                 break
         final_output = await self._generate_final_output()
@@ -1499,20 +1579,20 @@ class ResearchManager:
             self.output_manager.save_research_paper(self.research_dir, final_output)
         return final_output
 
-    def collect_decisions(self) -> List[ResearchDecision]:
+    async def collect_decisions(self) -> List[ResearchDecision]:
         decisions = []
         try:
-            reason_decisions = asyncio.run(self.reason_agent.analyze(self.current_context))
+            reason_decisions = await self.reason_agent.analyze(self.current_context)
         except Exception as e:
             logger.error(f"Error in reason agent analysis: {e}")
             reason_decisions = []
         try:
-            search_decisions = asyncio.run(self.search_agent.analyze(self.current_context))
+            search_decisions = await self.search_agent.analyze(self.current_context)
         except Exception as e:
             logger.error(f"Error in search agent analysis: {e}")
             search_decisions = []
         try:
-            explore_decisions = asyncio.run(self.explore_agent.analyze(self.current_context))
+            explore_decisions = await self.explore_agent.analyze(self.current_context)
         except Exception as e:
             logger.error(f"Error in explore agent analysis: {e}")
             explore_decisions = []
@@ -1541,9 +1621,9 @@ class ResearchManager:
             if not agent:
                 continue
             task = AgentTask(decision, agent, self.update_context_with_result)
-            tasks.append(create_task(task.run()))
+            tasks.append(asyncio.create_task(task.run()))
         if tasks:
-            await gather(*tasks)
+            await asyncio.gather(*tasks)
 
     def update_context_with_result(self, decision: ResearchDecision, result: Dict[str, Any]):
         content_item = self._create_content_item(decision, result)
@@ -1591,10 +1671,26 @@ class ResearchManager:
         else:
             return None
 
-    def _should_terminate(self) -> bool:
+    async def _should_terminate(self) -> bool:
         if self.current_context:
             contents = self.current_context.get_content("main")
-            return len(contents) >= self.config.get("min_new_content", 3)
+            if len(contents) >= self.config.get("min_new_content", 3):
+                return True
+        try:
+            reason_decisions = await self.reason_agent.analyze(self.current_context)
+            search_decisions = await self.search_agent.analyze(self.current_context)
+            explore_decisions = await self.explore_agent.analyze(self.current_context)
+            valid_decisions = [
+                d for d in (reason_decisions + search_decisions + explore_decisions)
+                if (d.decision_type != DecisionType.SEARCH or 
+                    d.context.get("query", "").strip() not in self.previous_searches)
+            ]
+            if not valid_decisions:
+                rprint("[yellow]Terminating: No further valid decisions from any agent.[/yellow]")
+                return True
+        except Exception as e:
+            rprint(f"[red]Error checking for new decisions: {str(e)}[/red]")
+            return False
         return False
 
     def persist_context(self):
@@ -1630,16 +1726,21 @@ class ResearchManager:
             "Please produce the final research paper in Markdown:"
         )
         
-        # Use the new OpenAI API format
-        client = OpenAI()
-        response = client.chat.completions.create(
-            model="o3-mini",
-            messages=[{"role": "user", "content": prompt}],
-            reasoning_effort="high",
-            max_completion_tokens=50000
-        )
-        final_markdown = response.choices[0].message.content.strip()
-        return final_markdown
+        try:
+            # Use the new OpenAI API format
+            client = OpenAI()
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model="o3-mini",
+                messages=[{"role": "user", "content": prompt}],
+                reasoning_effort="high",
+                max_completion_tokens=50000
+            )
+            final_markdown = response.choices[0].message.content.strip()
+            return final_markdown
+        except Exception as e:
+            logger.error(f"Error generating comprehensive markdown: {str(e)}")
+            return "Error generating research paper. Please try again."
 
     async def _generate_final_output(self) -> Dict[str, Any]:
         comprehensive_md = await self._generate_comprehensive_markdown()
@@ -1710,13 +1811,13 @@ class ResearchManager:
 ```python
 """
 Orchestrator for coordinating the multi-agent research workflow.
-Now fully asynchronous.
+Now fully asynchronous with parallel execution support.
 """
 
 import json
 import time
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set, Tuple
 from dataclasses import dataclass
 import asyncio
 from rich import print as rprint
@@ -1744,6 +1845,70 @@ class ResearchIteration:
     content_added: List[ContentItem]
     metrics: Dict[str, Any]
     timestamp: float = time.time()
+
+
+@dataclass
+class AgentTask:
+    """
+    Represents a single task to be executed by an agent.
+    Includes the decision, agent reference, and any metadata needed for execution.
+    """
+    decision: ResearchDecision
+    agent: Any
+    priority: float
+    metadata: Dict[str, Any]
+
+    async def execute(self) -> Tuple[ResearchDecision, Optional[Any]]:
+        """Execute the task and return the result along with the original decision."""
+        try:
+            result = await self.agent.execute_decision(self.decision)
+            return self.decision, result
+        except Exception as e:
+            logger.error(f"Error executing task: {str(e)}")
+            return self.decision, None
+
+
+class AgentTaskManager:
+    """
+    Manages the parallel execution of agent tasks with rate limiting and error handling.
+    """
+    def __init__(self, max_concurrent_tasks: int = 10):
+        self.max_concurrent_tasks = max_concurrent_tasks
+        self.semaphore = asyncio.Semaphore(max_concurrent_tasks)
+        self.tasks: List[AgentTask] = []
+
+    def add_task(self, task: AgentTask):
+        """Add a task to the execution queue."""
+        self.tasks.append(task)
+
+    async def _execute_task_with_semaphore(self, task: AgentTask) -> Tuple[ResearchDecision, Optional[Any]]:
+        """Execute a single task with semaphore-based concurrency control."""
+        async with self.semaphore:
+            return await task.execute()
+
+    async def execute_all(self) -> List[Tuple[ResearchDecision, Optional[Any]]]:
+        """Execute all tasks in parallel with controlled concurrency."""
+        if not self.tasks:
+            return []
+
+        # Sort tasks by priority
+        self.tasks.sort(key=lambda x: x.priority, reverse=True)
+        
+        # Create task coroutines
+        coroutines = [self._execute_task_with_semaphore(task) for task in self.tasks]
+        
+        # Execute all tasks and gather results
+        results = await asyncio.gather(*coroutines, return_exceptions=True)
+        
+        # Filter out exceptions and failed tasks
+        valid_results = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error(f"Task execution failed: {str(result)}")
+            elif result[1] is not None:  # Only include tasks with valid results
+                valid_results.append(result)
+        
+        return valid_results
 
 
 class ResearchOrchestrator:
@@ -1807,53 +1972,102 @@ class ResearchOrchestrator:
         return results
 
     async def _run_iteration(self, iteration_number: int) -> ResearchIteration:
+        """
+        Run a single research iteration with parallel execution of decisions.
+        """
         iteration_start = time.time()
         all_decisions = []
         content_added = []
+
         try:
+            # Get decisions from all agents
             reason_decisions = await self.reason_agent.analyze(self.current_context)
+            
+            # Check for termination decision first
             if any(d.decision_type == DecisionType.TERMINATE for d in reason_decisions):
                 all_decisions.extend(reason_decisions)
-            else:
-                search_decisions = await self.search_agent.analyze(self.current_context)
-                explore_decisions = await self.explore_agent.analyze(self.current_context)
-                all_decisions = reason_decisions + search_decisions + explore_decisions
-            sorted_decisions = sorted(all_decisions, key=lambda d: d.priority, reverse=True)
-            for decision in sorted_decisions:
+                return self._create_iteration_result(
+                    iteration_number, 
+                    all_decisions, 
+                    content_added, 
+                    time.time() - iteration_start
+                )
+
+            # Gather decisions from other agents
+            search_decisions = await self.search_agent.analyze(self.current_context)
+            explore_decisions = await self.explore_agent.analyze(self.current_context)
+            all_decisions = reason_decisions + search_decisions + explore_decisions
+
+            # Create task manager and add tasks
+            task_manager = AgentTaskManager(
+                max_concurrent_tasks=self.config.get("max_concurrent_tasks", 10)
+            )
+
+            # Filter and prepare tasks
+            for decision in sorted(all_decisions, key=lambda d: d.priority, reverse=True):
                 if decision.decision_type == DecisionType.TERMINATE:
-                    break
+                    continue
+
                 agent = self._get_agent_for_decision(decision)
                 if not agent:
                     continue
+
+                # Skip duplicate searches
                 if decision.decision_type == DecisionType.SEARCH:
                     query_str = decision.context.get("query", "").strip()
-                    if not query_str:
-                        continue
-                    if query_str in self.previous_searches:
+                    if not query_str or query_str in self.previous_searches:
                         rprint(f"[yellow]Skipping duplicate search: '{query_str}'[/yellow]")
                         continue
-                    else:
-                        self.previous_searches.add(query_str)
-                try:
-                    result = await agent.execute_decision(decision)
-                    if result:
-                        content_item = self._create_content_item(decision, result, iteration_number)
-                        self.current_context.add_content("main", content_item=content_item)
-                        content_added.append(content_item)
-                except Exception as e:
-                    rprint(f"[red]Error executing decision: {str(e)}[/red]")
+                    self.previous_searches.add(query_str)
+
+                # Create and add task
+                task = AgentTask(
+                    decision=decision,
+                    agent=agent,
+                    priority=decision.priority,
+                    metadata={"iteration": iteration_number}
+                )
+                task_manager.add_task(task)
+
+            # Execute all tasks in parallel
+            results = await task_manager.execute_all()
+
+            # Process results and update context
+            for decision, result in results:
+                if result:
+                    content_item = self._create_content_item(decision, result, iteration_number)
+                    self.current_context.add_content("main", content_item=content_item)
+                    content_added.append(content_item)
+
         except Exception as e:
             rprint(f"[red]Iteration error: {str(e)}[/red]")
+            logger.error(f"Iteration error: {str(e)}", exc_info=True)
+
+        return self._create_iteration_result(
+            iteration_number, 
+            all_decisions, 
+            content_added, 
+            time.time() - iteration_start
+        )
+
+    def _create_iteration_result(
+        self, 
+        iteration_number: int, 
+        decisions: List[ResearchDecision],
+        content: List[ContentItem],
+        iteration_time: float
+    ) -> ResearchIteration:
+        """Helper method to create a ResearchIteration result."""
         metrics = {
-            "iteration_time": time.time() - iteration_start,
-            "decisions_made": len(all_decisions),
-            "content_added": len(content_added),
+            "iteration_time": iteration_time,
+            "decisions_made": len(decisions),
+            "content_added": len(content),
             "agent_metrics": self._get_agent_metrics()
         }
         return ResearchIteration(
             iteration_number=iteration_number,
-            decisions_made=all_decisions,
-            content_added=content_added,
+            decisions_made=decisions,
+            content_added=content,
             metrics=metrics
         )
 
@@ -2270,6 +2484,7 @@ from typing import List, Dict, Any
 from rich import print as rprint
 from dotenv import load_dotenv
 import asyncio
+from openai import OpenAI
 
 load_dotenv()
 api_logger = logging.getLogger('api.perplexity')
@@ -2281,7 +2496,7 @@ class PerplexityClient:
         self.client = openai
         self.client.api_key = self.api_key
         self.client.api_base = "https://api.perplexity.ai"
-        self.model = "sonar-reasoning"
+        self.model = "sonar-pro"
         self.system_message = (
             "You are a research assistant helping to find accurate and up-to-date information. "
             "When providing information, always cite your sources in the format [Source: URL]. "
@@ -2290,21 +2505,50 @@ class PerplexityClient:
 
     async def search(self, query: str) -> Dict[str, Any]:
         """
-        Perform an asynchronous web search.
+        Perform an asynchronous web search using the Perplexity API via requests.
         """
         api_logger.info(f"Perplexity API Request - Query: {query}")
+        payload = {
+            "model": "sonar-reasoning",
+            "messages": [
+                {"role": "system", "content": self.system_message},
+                {"role": "user", "content": query}
+            ],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "search_domain_filter": ["perplexity.ai"],
+            "return_images": False,
+            "return_related_questions": False,
+            "search_recency_filter": "month",
+            "top_k": 0,
+            "stream": False,
+            "presence_penalty": 0,
+            "frequency_penalty": 1,
+            "response_format": None
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        url = "https://api.perplexity.ai/chat/completions"
+
         try:
-            params = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": self.system_message},
-                    {"role": "user", "content": query}
-                ],
-                "temperature": 0.7,
-                "stream": False
-            }
-            response = await openai.ChatCompletion.acreate(**params)
-            content = response.choices[0].message.content
+            response = await asyncio.to_thread(
+                lambda: __import__('requests').post(url, json=payload, headers=headers)
+            )
+            if response.status_code != 200:
+                api_logger.error(f"Perplexity API error: Error code: {response.status_code} - {response.text}")
+                return {
+                    "content": "",
+                    "urls": [],
+                    "query": query,
+                    "metadata": {}
+                }
+
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
             urls = self._extract_urls(content)
             api_logger.debug(f"Response data: {json.dumps({'content': content, 'urls': urls}, indent=2)}")
             return {
@@ -2312,8 +2556,8 @@ class PerplexityClient:
                 "urls": urls,
                 "query": query,
                 "metadata": {
-                    "model": self.model,
-                    "usage": response.usage
+                    "model": "sonar",
+                    "usage": data.get("usage", {})
                 }
             }
         except Exception as e:
@@ -2363,8 +2607,13 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.completion import WordCompleter
 from typing import Dict, Any, Optional
 import asyncio
+import builtins
 
 from rat.research.manager import ResearchManager
+
+# Ensure that dynamic execution contexts have access to asyncio and rprint
+builtins.asyncio = asyncio
+builtins.rprint = rprint
 
 
 def create_default_config() -> Dict[str, Any]:

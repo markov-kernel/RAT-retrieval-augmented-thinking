@@ -20,6 +20,63 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+class TokenBucket:
+    """
+    Implements the token bucket algorithm for rate limiting.
+    Provides a more flexible and efficient way to control API request rates.
+    """
+    def __init__(self, rate_limit: float, burst_limit: Optional[float] = None):
+        """
+        Initialize the token bucket.
+        
+        Args:
+            rate_limit: Number of tokens per minute
+            burst_limit: Maximum number of tokens that can be accumulated (defaults to rate_limit)
+        """
+        self.rate_limit = float(rate_limit)
+        self.burst_limit = float(burst_limit if burst_limit is not None else rate_limit)
+        self.tokens = self.burst_limit
+        self.last_update = asyncio.get_event_loop().time()
+        self._lock = asyncio.Lock()
+        
+    async def acquire(self, tokens: float = 1.0) -> float:
+        """
+        Acquire tokens from the bucket. Returns the wait time if tokens aren't available.
+        
+        Args:
+            tokens: Number of tokens to acquire (default: 1.0)
+            
+        Returns:
+            Float: Time to wait in seconds (0 if tokens are available immediately)
+        """
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            time_passed = now - self.last_update
+            self.tokens = min(
+                self.burst_limit,
+                self.tokens + time_passed * (self.rate_limit / 60.0)
+            )
+            self.last_update = now
+            
+            if self.tokens >= tokens:
+                self.tokens -= tokens
+                return 0.0
+            else:
+                wait_time = (tokens - self.tokens) * 60.0 / self.rate_limit
+                self.tokens = 0
+                return wait_time
+
+    async def try_acquire(self, tokens: float = 1.0) -> bool:
+        """
+        Try to acquire tokens without waiting.
+        
+        Returns:
+            bool: True if tokens were acquired, False otherwise
+        """
+        wait_time = await self.acquire(tokens)
+        return wait_time == 0.0
+
+
 class DecisionType(Enum):
     """Types of decisions an agent can make during research."""
     SEARCH = "search"      # New search query needed
@@ -53,7 +110,7 @@ class ResearchDecision:
 class BaseAgent(ABC):
     """
     Base class for all research agents.
-    All methods are now asynchronous.
+    All methods are now asynchronous with improved rate limiting.
     """
 
     def __init__(self, name: str, config: Optional[Dict[str, Any]] = None):
@@ -68,34 +125,36 @@ class BaseAgent(ABC):
             "parallel_executions": 0,
             "max_concurrent_tasks": 0,
             "rate_limit_delays": 0,
-            "retry_attempts": 0
+            "retry_attempts": 0,
+            "tokens_consumed": 0.0
         }
         self.max_workers = self.config.get("max_workers", 5)
         self.rate_limit = self.config.get("rate_limit", 100)
+        self.burst_limit = self.config.get("burst_limit", self.rate_limit * 1.5)
         self._active_tasks: Set[str] = set()
         self._tasks_lock = asyncio.Lock()
-        self._last_request_time = 0.0
-        self._rate_limit_lock = asyncio.Lock()
+        self._token_bucket = TokenBucket(self.rate_limit, self.burst_limit)
         self.logger = logging.getLogger(f"{__name__}.{name}")
-        self._last_api_call = 0.0
 
-    async def _enforce_rate_limit(self):
+    async def _enforce_rate_limit(self, tokens: float = 1.0) -> None:
         """
-        Ensure we do not exceed self.rate_limit requests per minute.
-        Uses an asynchronous lock and sleep.
+        Enforce rate limiting using the token bucket algorithm.
+        More sophisticated than the previous implementation, allowing for bursts
+        while still maintaining average rate limits.
+        
+        Args:
+            tokens: Number of tokens to consume (default: 1.0)
         """
         if self.rate_limit <= 0:
-            return  # no limiting
-        async with self._rate_limit_lock:
-            current_time = asyncio.get_event_loop().time()
-            elapsed = current_time - self._last_request_time
-            min_interval = 60.0 / self.rate_limit
-            if elapsed < min_interval:
-                sleep_time = min_interval - elapsed
-                await asyncio.sleep(sleep_time)
-                self.metrics["rate_limit_delays"] += 1
-            self._last_request_time = asyncio.get_event_loop().time()
-            self._last_api_call = current_time  # Update both timestamps
+            return
+
+        wait_time = await self._token_bucket.acquire(tokens)
+        if wait_time > 0:
+            self.metrics["rate_limit_delays"] += 1
+            self.logger.debug(f"Rate limit enforced, waiting {wait_time:.2f}s")
+            await asyncio.sleep(wait_time)
+        
+        self.metrics["tokens_consumed"] += tokens
 
     @abstractmethod
     async def analyze(self, context: 'ResearchContext') -> List[ResearchDecision]:
