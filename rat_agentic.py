@@ -4,15 +4,23 @@ Provides a command-line interface for conducting research using the agent-based 
 """
 
 import sys
+import json
 from rich import print as rprint
 from rich.panel import Panel
 from rich.markdown import Markdown
 from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
+from prompt_toolkit.completion import WordCompleter
 from typing import Dict, Any, Optional
-import json
+import asyncio
+import builtins
 
-from rat.research.orchestrator import ResearchOrchestrator
+from rat.research.manager import ResearchManager
+
+# Ensure that dynamic execution contexts have access to asyncio and rprint
+builtins.asyncio = asyncio
+builtins.rprint = rprint
+
 
 def create_default_config() -> Dict[str, Any]:
     """
@@ -25,31 +33,32 @@ def create_default_config() -> Dict[str, Any]:
         "max_iterations": 5,
         "min_new_content": 2,
         "min_confidence": 0.7,
-        
         "search_config": {
             "max_queries": 5,
             "min_priority": 0.3,
-            "refinement_threshold": 0.7
+            "refinement_threshold": 0.7,
+            "rate_limit": 20      # Updated: Perplexity rate limit set to 20 requests per minute
         },
-        
         "explore_config": {
             "max_urls": 10,
             "min_priority": 0.3,
             "allowed_domains": []
         },
-        
         "reason_config": {
             "max_parallel_tasks": 3,
             "chunk_size": 30000,
-            "min_priority": 0.3
+            "min_priority": 0.3,
+            "rate_limit": 200,     # Updated: O3 mini rate limit set to 200 requests per minute
+            "flash_fix_rate_limit": 10
         },
-        
         "execute_config": {
             "model": "claude-3-5-sonnet-20241022",
             "min_priority": 0.3,
             "max_retries": 2
-        }
+        },
+        "max_workers": 20
     }
+
 
 def display_results(results: Dict[str, Any]):
     """
@@ -62,14 +71,12 @@ def display_results(results: Dict[str, Any]):
         rprint(f"\n[red]Error during research: {results['error']}[/red]")
         return
         
-    # Display paper
     rprint(Panel(
         Markdown(results["paper"]),
         title="[bold green]Research Paper[/bold green]",
         border_style="green"
     ))
     
-    # Display metrics
     metrics = results.get("metrics", {})
     
     rprint("\n[bold cyan]Research Metrics:[/bold cyan]")
@@ -77,8 +84,6 @@ def display_results(results: Dict[str, Any]):
     rprint(f"Iterations: {metrics.get('iterations', 0)}")
     rprint(f"Total decisions: {metrics.get('total_decisions', 0)}")
     rprint(f"Total content items: {metrics.get('total_content', 0)}")
-    
-    # Display agent metrics
     agent_metrics = metrics.get("agent_metrics", {})
     for agent_name, agent_data in agent_metrics.items():
         rprint(f"\n[bold]{agent_name.title()} Agent:[/bold]")
@@ -90,18 +95,16 @@ def display_results(results: Dict[str, Any]):
             f"{agent_data.get('total_execution_time', 0) / max(agent_data.get('decisions_made', 1), 1):.2f}s"
         )
 
-def main():
+
+async def main_async():
     """Main entry point for the research system."""
-    # Initialize style
     style = Style.from_dict({
         'prompt': 'orange bold',
     })
     session = PromptSession(style=style)
     
-    # Create orchestrator with default config
-    orchestrator = ResearchOrchestrator(create_default_config())
+    manager = ResearchManager(create_default_config())
     
-    # Display welcome message
     rprint(Panel.fit(
         "[bold cyan]RAT Multi-Agent Research System[/bold cyan]\n"
         "Conduct research using a coordinated team of specialized AI agents",
@@ -116,37 +119,32 @@ def main():
     rprint(" • Enter your research question to begin\n")
     
     latest_results: Optional[Dict[str, Any]] = None
+    commands = WordCompleter(['quit', 'config', 'metrics'])
     
     while True:
         try:
-            user_input = session.prompt("\nResearch Question: ", style=style).strip()
+            user_input = await session.prompt_async("\nResearch Question: ", completer=commands)
+            user_input = user_input.strip()
             
             if user_input.lower() == 'quit':
                 rprint("\nGoodbye! 👋")
                 break
-                
             elif user_input.lower() == 'config':
                 rprint(Panel(
-                    Markdown(f"```json\n{json.dumps(orchestrator.config, indent=2)}\n```"),
+                    Markdown(f"```json\n{json.dumps(manager.config, indent=2)}\n```"),
                     title="[bold cyan]Current Configuration[/bold cyan]",
                     border_style="cyan"
                 ))
                 continue
-                
             elif user_input.lower() == 'metrics':
                 if latest_results:
                     display_results(latest_results)
                 else:
                     rprint("[yellow]No research has been conducted yet[/yellow]")
                 continue
-                
-            # Conduct research
             rprint(f"\n[bold cyan]Starting research on:[/bold cyan] {user_input}")
-            latest_results = orchestrator.start_research(user_input)
-            
-            # Display results
+            latest_results = await manager.start_research(user_input)
             display_results(latest_results)
-            
         except KeyboardInterrupt:
             continue
         except EOFError:
@@ -154,5 +152,11 @@ def main():
         except Exception as e:
             rprint(f"[red]Error: {str(e)}[/red]")
 
+
+def main():
+    """Run the async main function."""
+    asyncio.run(main_async())
+
+
 if __name__ == "__main__":
-    main() 
+    main()

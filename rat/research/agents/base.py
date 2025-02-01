@@ -1,27 +1,33 @@
 """
 Base agent interface and core decision-making structures.
 Defines the contract that all specialized research agents must implement.
-Includes support for parallel processing and concurrency control.
+This async version uses asyncio locks and awaits where appropriate.
 """
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .context import ResearchContext
+
 from enum import Enum
 from rich import print as rprint
-from concurrent.futures import ThreadPoolExecutor
-import threading
+import asyncio
 import time
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 class DecisionType(Enum):
     """Types of decisions an agent can make during research."""
     SEARCH = "search"      # New search query needed
     EXPLORE = "explore"    # URL exploration needed
     REASON = "reason"      # Deep analysis needed (using Gemini now)
-    TERMINATE = "terminate"# Research complete or no further steps
+    EXECUTE = "execute"     # Execution of a decision
+    TERMINATE = "terminate"  # Research complete or no further steps
+
 
 @dataclass
 class ResearchDecision:
@@ -38,28 +44,19 @@ class ResearchDecision:
     priority: float
     context: Dict[str, Any]
     rationale: str
-    
+
     def __post_init__(self):
         if not 0 <= self.priority <= 1:
             raise ValueError("Priority must be between 0 and 1")
 
+
 class BaseAgent(ABC):
     """
     Base class for all research agents.
-    
-    Each specialized agent (search, explore, reason) must implement
-    the analyze method to make decisions based on the current research context.
-    Supports parallel execution of decisions with concurrency control.
+    All methods are now asynchronous.
     """
-    
+
     def __init__(self, name: str, config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the agent.
-        
-        Args:
-            name: Unique identifier for this agent instance
-            config: Optional configuration parameters
-        """
         self.name = name
         self.config = config or {}
         self.decisions_made = []
@@ -73,64 +70,43 @@ class BaseAgent(ABC):
             "rate_limit_delays": 0,
             "retry_attempts": 0
         }
-        
-        # Concurrency controls
         self.max_workers = self.config.get("max_workers", 5)
-        # Rate limit: requests per minute
         self.rate_limit = self.config.get("rate_limit", 100)
-        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
         self._active_tasks: Set[str] = set()
-        self._tasks_lock = threading.Lock()
+        self._tasks_lock = asyncio.Lock()
         self._last_request_time = 0.0
-        self._rate_limit_lock = threading.Lock()
-        
-        # Initialize logger
+        self._rate_limit_lock = asyncio.Lock()
         self.logger = logging.getLogger(f"{__name__}.{name}")
-    
-    def _enforce_rate_limit(self):
+        self._last_api_call = 0.0
+
+    async def _enforce_rate_limit(self):
         """
         Ensure we do not exceed self.rate_limit requests per minute.
-        We'll do a simple 'sleep' if we haven't waited long enough
-        since the last request.
+        Uses an asynchronous lock and sleep.
         """
         if self.rate_limit <= 0:
             return  # no limiting
-            
-        with self._rate_limit_lock:
-            current_time = time.time()
+        async with self._rate_limit_lock:
+            current_time = asyncio.get_event_loop().time()
             elapsed = current_time - self._last_request_time
-            
-            # requests-per-minute => min interval
             min_interval = 60.0 / self.rate_limit
-            
             if elapsed < min_interval:
                 sleep_time = min_interval - elapsed
-                time.sleep(sleep_time)
+                await asyncio.sleep(sleep_time)
                 self.metrics["rate_limit_delays"] += 1
-            
-            self._last_request_time = time.time()
-            
+            self._last_request_time = asyncio.get_event_loop().time()
+            self._last_api_call = current_time  # Update both timestamps
+
     @abstractmethod
-    def analyze(self, context: 'ResearchContext') -> List[ResearchDecision]:
+    async def analyze(self, context: 'ResearchContext') -> List[ResearchDecision]:
         """
         Analyze the current research context and make decisions.
-        
-        Args:
-            context: Current state of the research process
-            
-        Returns:
-            List of decisions recommended by this agent
         """
         pass
-    
+
     def log_decision(self, decision: ResearchDecision, success: bool = True, execution_time: float = 0.0):
         """
         Log a decision made by this agent and update metrics.
-        
-        Args:
-            decision: The decision that was made
-            success: Whether the decision execution was successful
-            execution_time: Time taken to execute the decision
         """
         self.decisions_made.append(decision)
         self.metrics["decisions_made"] += 1
@@ -139,50 +115,25 @@ class BaseAgent(ABC):
         else:
             self.metrics["failed_executions"] += 1
         self.metrics["total_execution_time"] += execution_time
-    
+
     @abstractmethod
-    def can_handle(self, decision: ResearchDecision) -> bool:
-        """
-        Check if this agent can handle a given decision type.
-        
-        Args:
-            decision: Decision to evaluate
-            
-        Returns:
-            True if this agent can handle the decision
-        """
-        pass
-    
-    @abstractmethod
-    def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
+    async def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
         """
         Execute a decision made by this or another agent.
-        
-        Args:
-            decision: Decision to execute
-            
-        Returns:
-            Results of executing the decision
         """
         pass
-    
+
     def get_decision_history(self) -> List[ResearchDecision]:
         """
         Get the history of decisions made by this agent.
-        
-        Returns:
-            List of past decisions
         """
         return self.decisions_made.copy()
-    
+
     def get_metrics(self) -> Dict[str, Any]:
         """
         Get the current metrics for this agent.
-        
-        Returns:
-            Dictionary of agent metrics
         """
         return self.metrics.copy()
-    
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name='{self.name}')"

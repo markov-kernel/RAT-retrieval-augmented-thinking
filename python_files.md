@@ -82,7 +82,7 @@ __all__ = [
 """
 Base agent interface and core decision-making structures.
 Defines the contract that all specialized research agents must implement.
-Includes support for parallel processing and concurrency control.
+This async version uses asyncio locks and awaits where appropriate.
 """
 
 from abc import ABC, abstractmethod
@@ -90,19 +90,20 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional, Set
 from enum import Enum
 from rich import print as rprint
-from concurrent.futures import ThreadPoolExecutor
-import threading
+import asyncio
 import time
 import logging
 
 logger = logging.getLogger(__name__)
+
 
 class DecisionType(Enum):
     """Types of decisions an agent can make during research."""
     SEARCH = "search"      # New search query needed
     EXPLORE = "explore"    # URL exploration needed
     REASON = "reason"      # Deep analysis needed (using Gemini now)
-    TERMINATE = "terminate"# Research complete or no further steps
+    TERMINATE = "terminate"  # Research complete or no further steps
+
 
 @dataclass
 class ResearchDecision:
@@ -119,28 +120,19 @@ class ResearchDecision:
     priority: float
     context: Dict[str, Any]
     rationale: str
-    
+
     def __post_init__(self):
         if not 0 <= self.priority <= 1:
             raise ValueError("Priority must be between 0 and 1")
 
+
 class BaseAgent(ABC):
     """
     Base class for all research agents.
-    
-    Each specialized agent (search, explore, reason) must implement
-    the analyze method to make decisions based on the current research context.
-    Supports parallel execution of decisions with concurrency control.
+    All methods are now asynchronous.
     """
-    
+
     def __init__(self, name: str, config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the agent.
-        
-        Args:
-            name: Unique identifier for this agent instance
-            config: Optional configuration parameters
-        """
         self.name = name
         self.config = config or {}
         self.decisions_made = []
@@ -154,64 +146,41 @@ class BaseAgent(ABC):
             "rate_limit_delays": 0,
             "retry_attempts": 0
         }
-        
-        # Concurrency controls
         self.max_workers = self.config.get("max_workers", 5)
-        # Rate limit: requests per minute
         self.rate_limit = self.config.get("rate_limit", 100)
-        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
         self._active_tasks: Set[str] = set()
-        self._tasks_lock = threading.Lock()
+        self._tasks_lock = asyncio.Lock()
         self._last_request_time = 0.0
-        self._rate_limit_lock = threading.Lock()
-        
-        # Initialize logger
+        self._rate_limit_lock = asyncio.Lock()
         self.logger = logging.getLogger(f"{__name__}.{name}")
-    
-    def _enforce_rate_limit(self):
+
+    async def _enforce_rate_limit(self):
         """
         Ensure we do not exceed self.rate_limit requests per minute.
-        We'll do a simple 'sleep' if we haven't waited long enough
-        since the last request.
+        Uses an asynchronous lock and sleep.
         """
         if self.rate_limit <= 0:
             return  # no limiting
-            
-        with self._rate_limit_lock:
-            current_time = time.time()
+        async with self._rate_limit_lock:
+            current_time = asyncio.get_event_loop().time()
             elapsed = current_time - self._last_request_time
-            
-            # requests-per-minute => min interval
             min_interval = 60.0 / self.rate_limit
-            
             if elapsed < min_interval:
                 sleep_time = min_interval - elapsed
-                time.sleep(sleep_time)
+                await asyncio.sleep(sleep_time)
                 self.metrics["rate_limit_delays"] += 1
-            
-            self._last_request_time = time.time()
-            
+            self._last_request_time = asyncio.get_event_loop().time()
+
     @abstractmethod
-    def analyze(self, context: 'ResearchContext') -> List[ResearchDecision]:
+    async def analyze(self, context: 'ResearchContext') -> List[ResearchDecision]:
         """
         Analyze the current research context and make decisions.
-        
-        Args:
-            context: Current state of the research process
-            
-        Returns:
-            List of decisions recommended by this agent
         """
         pass
-    
+
     def log_decision(self, decision: ResearchDecision, success: bool = True, execution_time: float = 0.0):
         """
         Log a decision made by this agent and update metrics.
-        
-        Args:
-            decision: The decision that was made
-            success: Whether the decision execution was successful
-            execution_time: Time taken to execute the decision
         """
         self.decisions_made.append(decision)
         self.metrics["decisions_made"] += 1
@@ -220,51 +189,26 @@ class BaseAgent(ABC):
         else:
             self.metrics["failed_executions"] += 1
         self.metrics["total_execution_time"] += execution_time
-    
+
     @abstractmethod
-    def can_handle(self, decision: ResearchDecision) -> bool:
-        """
-        Check if this agent can handle a given decision type.
-        
-        Args:
-            decision: Decision to evaluate
-            
-        Returns:
-            True if this agent can handle the decision
-        """
-        pass
-    
-    @abstractmethod
-    def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
+    async def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
         """
         Execute a decision made by this or another agent.
-        
-        Args:
-            decision: Decision to execute
-            
-        Returns:
-            Results of executing the decision
         """
         pass
-    
+
     def get_decision_history(self) -> List[ResearchDecision]:
         """
         Get the history of decisions made by this agent.
-        
-        Returns:
-            List of past decisions
         """
         return self.decisions_made.copy()
-    
+
     def get_metrics(self) -> Dict[str, Any]:
         """
         Get the current metrics for this agent.
-        
-        Returns:
-            Dictionary of agent metrics
         """
         return self.metrics.copy()
-    
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(name='{self.name}')"
 ```
@@ -574,6 +518,31 @@ class ResearchContext:
             context.branches[bid] = branch
             
         return context
+
+    def save_to_file(self, file_path: str):
+        """
+        Persist the research context to a JSON file.
+        
+        Args:
+            file_path: Path where the context JSON should be saved.
+        """
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load_from_file(cls, file_path: str) -> 'ResearchContext':
+        """
+        Load a research context from a JSON file.
+        
+        Args:
+            file_path: Path to the JSON file.
+            
+        Returns:
+            An instance of ResearchContext.
+        """
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return cls.from_dict(data)
 ```
 
 ## rat/research/agents/explore.py
@@ -581,7 +550,7 @@ class ResearchContext:
 ```python
 """
 Explore agent for extracting content from URLs.
-Now acts as a simple executor that processes EXPLORE decisions from the ReasoningAgent.
+Now acts as a simple executor that processes EXPLORE decisions.
 """
 
 from typing import List, Dict, Any, Optional
@@ -594,47 +563,35 @@ from ..firecrawl_client import FirecrawlClient
 
 logger = logging.getLogger(__name__)
 
+
 class ExploreAgent(BaseAgent):
     """
     Agent responsible for extracting content from URLs.
-    Acts as an executor for EXPLORE decisions made by the ReasoningAgent.
     """
-    
+
     def __init__(self, firecrawl_client: FirecrawlClient, config=None):
         super().__init__("explore", config)
         self.firecrawl = firecrawl_client
         self.logger = logging.getLogger(__name__)
-        
-    def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
-        """
-        No longer generates decisions - URL selection is handled by ReasoningAgent.
-        """
+
+    async def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
+        # URL selection is handled by ReasoningAgent.
         return []
-        
+
     def can_handle(self, decision: ResearchDecision) -> bool:
-        """Check if this agent can handle a decision."""
         return decision.decision_type == DecisionType.EXPLORE
-        
-    def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
+
+    async def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
         """
         Execute an EXPLORE decision by scraping the URL.
-        
-        Args:
-            decision: The EXPLORE decision containing the URL to scrape
-            
-        Returns:
-            Dict containing the scraped content
         """
         url = decision.context["url"]
         self.logger.info(f"Exploring URL: {url}")
-        
         try:
-            scrape_result = self.firecrawl.extract_content(url)
-            
+            scrape_result = await self.firecrawl.extract_content(url)
             if not scrape_result:
                 self.logger.warning(f"No content extracted from URL: {url}")
                 return {}
-                
             return {
                 "url": url,
                 "title": scrape_result.get("title", ""),
@@ -645,167 +602,107 @@ class ExploreAgent(BaseAgent):
                     "rationale": decision.context.get("rationale", "")
                 }
             }
-            
         except Exception as e:
             self.logger.error(f"Error exploring URL {url}: {str(e)}")
-            return {
-                "url": url,
-                "error": str(e)
-            }
+            return {"url": url, "error": str(e)}
 ```
 
 ## rat/research/agents/reason.py
 
 ```python
 """
-Reasoning agent for analyzing research content using the Gemini 2.0 Flash Thinking model.
-Now it also acts as the "lead agent" that decides next steps (search, explore, etc.).
-Supports parallel processing of content analysis and decision making.
-
-Key responsibilities:
-1. Analyzing content using Gemini
-2. Deciding which URLs to explore
-3. Identifying knowledge gaps
-4. Determining when to terminate research
+Reasoning agent for analyzing research content using the o3-mini model with high reasoning effort.
+Now acts as the "lead agent" that decides next steps.
+All methods are now asynchronous.
 """
 
+import asyncio
 from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from rich import print as rprint
-import os
-import json
 import logging
+import json
 import re
 from urllib.parse import urlparse
-import threading
-from time import sleep
-
-import google.generativeai as genai
+from openai import OpenAI
 
 from .base import BaseAgent, ResearchDecision, DecisionType
 from .context import ResearchContext, ContentType, ContentItem
 
-# Get loggers
 logger = logging.getLogger(__name__)
-api_logger = logging.getLogger('api.gemini')
+api_logger = logging.getLogger('api.o3mini')
+
 
 @dataclass
 class AnalysisTask:
-    """
-    Represents a content analysis task.
-    
-    Attributes:
-        content: The textual content to analyze
-        priority: Analysis priority (0-1)
-        rationale: Why this analysis is needed
-        chunk_index: If chunked, the index of this chunk
-    """
     content: str
     priority: float
     rationale: str
     chunk_index: Optional[int] = None
     timestamp: float = time.time()
 
+
 class ReasoningAgent(BaseAgent):
     """
-    Reasoning agent for analyzing research content using the Gemini 2.0 Flash Thinking model.
-    Now it also acts as the "lead agent" that decides next steps (search, explore, etc.).
-    Supports parallel processing of content analysis and decision making.
+    Reasoning agent for analyzing research content.
     """
-    
+
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """Initialize the reasoning agent."""
         super().__init__("reason", config)
-        
-        # Configure Gemini model
-        self.generation_config = {
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "max_output_tokens": 50000,
-            "response_mime_type": "text/plain"
-        }
-        self.model_name = "gemini-2.0-flash-thinking-exp-01-21"
-
-        # Initialize the model
-        self._model = None
-
-        # Initialize logger
-        self.logger = logging.getLogger(__name__)
-
-        # Configure the Gemini client
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-
-        # We'll chunk input up to a 1,048,576 token estimate
-        self.max_tokens_per_call = 1048576  
-        self.max_output_tokens = 65536
-        self.request_timeout = self.config.get("gemini_timeout", 180)
-
-        # For concurrency chunk splitting
-        self.chunk_margin = 5000   # Safety margin
-        
-        # Add max_parallel_tasks from config
+        self.model_name = "o3-mini"
+        self.max_output_tokens = self.config.get("max_output_tokens", 50000)
+        self.request_timeout = self.config.get("o3_mini_timeout", 180)
+        self.reasoning_effort = "high"
+        self.chunk_margin = 5000
         self.max_parallel_tasks = self.config.get("max_parallel_tasks", 3)
-
-        # Priority thresholds
         self.min_priority = self.config.get("min_priority", 0.3)
         self.min_url_relevance = self.config.get("min_url_relevance", 0.6)
-
-        # URL tracking
         self.explored_urls: Set[str] = set()
-        
-        # Flash-fix rate limiting
         self.flash_fix_rate_limit = self.config.get("flash_fix_rate_limit", 10)
         self._flash_fix_last_time = 0.0
-        self._flash_fix_lock = threading.Lock()
-        
-        logger.info("ReasoningAgent initialized to use Gemini model: %s", self.model_name)
-        
-        # Tracking
+        self._flash_fix_lock = asyncio.Lock()
+        logger.info("ReasoningAgent initialized to use o3-mini model: %s", self.model_name)
         self.analysis_tasks: Dict[str, AnalysisTask] = {}
-        
-    @property
-    def model(self):
-        """Lazy initialization of the Gemini model."""
-        if self._model is None:
-            self._model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config=self.generation_config
-            )
-        return self._model
 
-    def _get_model(self) -> genai.GenerativeModel:
-        """Get or create the Gemini model instance."""
-        return self.model  # Use the property
-
-    def _enforce_flash_fix_limit(self):
-        """
-        Ensure we do not exceed flash_fix_rate_limit requests per minute.
-        """
+    async def _enforce_flash_fix_limit(self):
         if self.flash_fix_rate_limit <= 0:
             return
-            
-        with self._flash_fix_lock:
-            current_time = time.time()
+        async with self._flash_fix_lock:
+            current_time = asyncio.get_event_loop().time()
             elapsed = current_time - self._flash_fix_last_time
             min_interval = 60.0 / self.flash_fix_rate_limit
-            
             if elapsed < min_interval:
-                sleep_time = min_interval - elapsed
-                time.sleep(sleep_time)
+                await asyncio.sleep(min_interval - elapsed)
                 self.metrics["rate_limit_delays"] += 1
-            
-            self._flash_fix_last_time = time.time()
-            
-    def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
-        """
-        Primary entry point for making decisions about next research steps.
-        Now also responsible for URL exploration decisions.
-        """
+            self._flash_fix_last_time = asyncio.get_event_loop().time()
+
+    async def _call_o3_mini(self, prompt: str, context: str = "") -> str:
+        messages = []
+        if context:
+            messages.append({"role": "assistant", "content": context})
+        messages.append({"role": "user", "content": prompt})
+        api_logger.info(f"o3-mini API Request - Prompt length: {len(prompt)}")
+        try:
+            # Use the new OpenAI API format
+            client = OpenAI()
+            params = {
+                "model": self.model_name,
+                "messages": messages,
+                "reasoning_effort": self.reasoning_effort,
+                "max_completion_tokens": self.max_output_tokens,
+            }
+            if "JSON" in prompt or "json" in prompt:
+                params["response_format"] = {"type": "json_object"}
+            response = client.chat.completions.create(**params)
+            text = response.choices[0].message.content.strip()
+            return text
+        except Exception as e:
+            api_logger.error(f"o3-mini API error: {str(e)}")
+            raise
+
+    async def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
         decisions = []
-        
-        # 1. If no search results yet, start with a broad search
         search_results = context.get_content("main", ContentType.SEARCH_RESULT)
         if not search_results:
             decisions.append(
@@ -820,32 +717,19 @@ class ReasoningAgent(BaseAgent):
                 )
             )
             return decisions
-        
-        # 2. Process unvisited URLs from search results
+
         explored_content = context.get_content("main", ContentType.EXPLORED_CONTENT)
-        explored_urls = {
+        explored_urls = { 
             item.content.get("url", "") for item in explored_content
             if isinstance(item.content, dict)
         }
         self.explored_urls.update(explored_urls)
-        
-        # Collect unvisited URLs from search results
         unvisited_urls = set()
         for result in search_results:
             if isinstance(result.content, dict):
                 urls = result.content.get("urls", [])
-                unvisited_urls.update(
-                    url for url in urls 
-                    if url not in self.explored_urls
-                )
-        
-        # Filter and prioritize URLs
-        relevant_urls = self._filter_relevant_urls(
-            list(unvisited_urls), 
-            context
-        )
-        
-        # Create EXPLORE decisions for relevant URLs
+                unvisited_urls.update(url for url in urls if url not in self.explored_urls)
+        relevant_urls = await self._filter_relevant_urls(list(unvisited_urls), context)
         for url, relevance in relevant_urls:
             if relevance >= self.min_url_relevance:
                 decisions.append(
@@ -860,22 +744,11 @@ class ReasoningAgent(BaseAgent):
                         rationale=f"URL relevance score: {relevance:.2f}"
                     )
                 )
-        
-        # 3. Process any unanalyzed content
-        unprocessed_search = [
-            item for item in search_results
-            if not item.metadata.get("analyzed_by_reasoner")
-        ]
-        unprocessed_explored = [
-            item for item in explored_content
-            if not item.metadata.get("analyzed_by_reasoner")
-        ]
-        
-        # Create REASON decisions for unprocessed content
+        unprocessed_search = [item for item in search_results if not item.metadata.get("analyzed_by_reasoner")]
+        unprocessed_explored = [item for item in explored_content if not item.metadata.get("analyzed_by_reasoner")]
         for item in unprocessed_search + unprocessed_explored:
             if item.priority < self.min_priority:
                 continue
-                
             decisions.append(
                 ResearchDecision(
                     decision_type=DecisionType.REASON,
@@ -888,46 +761,24 @@ class ReasoningAgent(BaseAgent):
                     rationale=f"Analyze new {item.content_type.value} content"
                 )
             )
-        
-        # 4. Check for knowledge gaps - but only if we have context
-        # Build combined text from search results, explored content, and existing analysis
-        search_text = "\n".join(
-            str(item.content) 
-            for item in search_results 
-            if isinstance(item.content, str)
-        )
-        explored_text = "\n".join(
-            str(item.content) 
-            for item in explored_content 
-            if isinstance(item.content, str)
-        )
+        search_text = "\n".join(str(item.content) for item in search_results if isinstance(item.content, str))
+        explored_text = "\n".join(str(item.content) for item in explored_content if isinstance(item.content, str))
         analysis_items = context.get_content("main", ContentType.ANALYSIS)
         analysis_text = "\n".join(
-            item.content.get("analysis", "")
-            if isinstance(item.content, dict) else str(item.content)
+            (item.content.get("analysis", "") if isinstance(item.content, dict) else str(item.content))
             for item in analysis_items
         )
-
         combined_analysis = f"{search_text}\n\n{explored_text}\n\n{analysis_text}".strip()
-        
-        if combined_analysis:  # Only check for gaps if we have some real context
-            gaps = self._identify_knowledge_gaps(
-                context.initial_question,
-                combined_analysis
-            )
-            
-            # Filter out any gaps with placeholders
+        if combined_analysis:
+            gaps = await self._identify_knowledge_gaps(context.initial_question, combined_analysis)
             filtered_gaps = []
             for gap in gaps:
                 query_str = gap.get("query", "")
                 url_str = gap.get("url", "")
-                # Skip if the LLM hallucinated placeholders
-                if "[" in query_str or "]" in query_str or "[" in url_str or "]" in url_str:
+                if any(x in query_str or x in url_str for x in ("[", "]")):
                     self.logger.warning(f"Skipping gap with placeholders: {gap}")
                     continue
                 filtered_gaps.append(gap)
-            
-            # Create new SEARCH or EXPLORE decisions for filtered gaps
             for gap in filtered_gaps:
                 if gap["type"] == "search":
                     decisions.append(
@@ -955,11 +806,8 @@ class ReasoningAgent(BaseAgent):
                             )
                         )
         else:
-            # No real context yet, skip knowledge gap detection
-            self.logger.info("Skipping knowledge gap analysis because we have no contextual text.")
-        
-        # 5. Check if we should terminate
-        if self._should_terminate(context):
+            self.logger.info("Skipping knowledge gap analysis due to lack of context.")
+        if await self._should_terminate(context):
             decisions.append(
                 ResearchDecision(
                     decision_type=DecisionType.TERMINATE,
@@ -968,392 +816,176 @@ class ReasoningAgent(BaseAgent):
                     rationale="Research question appears to be sufficiently answered"
                 )
             )
-        
         return decisions
-        
+
     def can_handle(self, decision: ResearchDecision) -> bool:
-        """
-        Check if this agent can handle a decision.
-        
-        Args:
-            decision: Decision to evaluate
-            
-        Returns:
-            True if this agent can handle the decision
-        """
         return decision.decision_type == DecisionType.REASON
-        
-    def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
-        """
-        Execute a reasoning decision using Gemini.
-        Potentially split content into multiple chunks and run them in parallel, then merge.
-        Only stores the actual analysis text, not any suggestions or placeholders.
-        """
-        start_time = time.time()
+
+    async def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
+        start_time = asyncio.get_event_loop().time()
         success = False
         results = {}
-        
         try:
             content = decision.context["content"]
             content_type = decision.context["content_type"]
             item_id = decision.context["item_id"]
-            
-            # Convert content to string for token counting
             content_str = str(content)
             tokens_estimated = len(content_str) // 4
-            
-            if tokens_estimated > self.max_tokens_per_call:
-                # Chunked parallel analysis
-                chunk_results = self._parallel_analyze_content(content_str, content_type)
-                combined = self._combine_chunk_results(chunk_results)
-                results = combined
+            if tokens_estimated > self.max_output_tokens:
+                chunk_results = await self._parallel_analyze_content(content_str, content_type)
+                results = self._combine_chunk_results(chunk_results)
             else:
-                # Single chunk
-                single_result = self._analyze_content_chunk(content_str, content_type)
-                results = single_result
-            
-            # We only consider it successful if we got actual analysis text
+                results = await self._analyze_content_chunk(content_str, content_type)
             success = bool(results.get("analysis", "").strip())
-            
-            # Tag the original content item as "analyzed_by_reasoner"
             decision.context["analyzed_by_reasoner"] = True
-            
-            # Package only the analysis-related content, no suggestions or placeholders
             final_results = {
                 "analysis": results.get("analysis", ""),
                 "insights": results.get("insights", []),
                 "analyzed_item_id": item_id
             }
-            
             if success:
                 rprint(f"[green]ReasoningAgent: Analysis completed for content type '{content_type}'[/green]")
             else:
                 rprint(f"[yellow]ReasoningAgent: No analysis produced for '{content_type}'[/yellow]")
-                
             return final_results
-            
         except Exception as e:
             rprint(f"[red]ReasoningAgent error: {str(e)}[/red]")
-            return {
-                "error": str(e),
-                "analysis": "",
-                "insights": []
-            }
-            
+            return {"error": str(e), "analysis": "", "insights": []}
         finally:
-            execution_time = time.time() - start_time
+            execution_time = asyncio.get_event_loop().time() - start_time
             self.log_decision(decision, success, execution_time)
-        
-    def _parallel_analyze_content(self, content: str, content_type: str) -> List[Dict[str, Any]]:
-        """
-        Splits large text into ~64k token chunks, then spawns parallel requests to Gemini.
-        """
+
+    async def _parallel_analyze_content(self, content: str, content_type: str) -> List[Dict[str, Any]]:
         words = content.split()
-        chunk_size_words = self.max_tokens_per_call * 4  # approximate word limit
+        chunk_size_words = self.max_output_tokens * 4
         chunks = []
-        
         idx = 0
         while idx < len(words):
             chunk = words[idx: idx + chunk_size_words]
             chunks.append(" ".join(chunk))
             idx += chunk_size_words
-        
-        chunk_results = []
-        with ThreadPoolExecutor(max_workers=self.max_parallel_tasks) as executor:
-            future_map = {
-                executor.submit(self._analyze_content_chunk, chunk, f"{content_type}_chunk_{i}"): i
-                for i, chunk in enumerate(chunks)
-            }
-            for future in as_completed(future_map):
-                chunk_index = future_map[future]
-                try:
-                    res = future.result()
-                    res["chunk_index"] = chunk_index
-                    chunk_results.append(res)
-                except Exception as e:
-                    rprint(f"[red]Error in chunk {chunk_index}: {e}[/red]")
-        
+        tasks = []
+        for i, chunk in enumerate(chunks):
+            tasks.append(asyncio.create_task(self._analyze_content_chunk(chunk, f"{content_type}_chunk_{i}")))
+        chunk_results = await asyncio.gather(*tasks, return_exceptions=False)
+        for i, res in enumerate(chunk_results):
+            res["chunk_index"] = i
         return chunk_results
-        
-    def _analyze_content_chunk(self, content: str, content_type: str) -> Dict[str, Any]:
-        """
-        Calls Gemini with a single-turn prompt to analyze the content.
-        We'll store only the final 'analysis' portion, ignoring any next-step JSON the LLM appends.
-        """
-        # Enforce main rate limit
-        self._enforce_rate_limit()
-        
-        # Create a chat session
-        model = self._get_model()
-        chat_session = model.start_chat(history=[])
 
-        # We explicitly instruct the model to avoid placeholders and next steps
+    async def _analyze_content_chunk(self, content: str, content_type: str) -> Dict[str, Any]:
+        await self._enforce_flash_fix_limit()
         prompt = (
-            "You are an advanced reasoning model (Gemini 2.0 Flash Thinking). "
+            "You are an advanced reasoning model (o3-mini) with high reasoning effort. "
             "Analyze the following text for key insights, patterns, or relevant facts. "
-            "Provide ONLY factual analysis and insights. "
-            "DO NOT include any placeholders (like [company name] or [person]).\n"
-            "DO NOT suggest next steps or additional searches.\n"
-            "DO NOT output JSON or structured data.\n\n"
+            "Provide ONLY factual analysis and insights without placeholders or next-step suggestions.\n\n"
             f"CONTENT:\n{content}\n\n"
             "Please provide your analysis below (plain text only):"
         )
-        
-        response = chat_session.send_message(prompt)
-        analysis_text = response.text.strip()
-        
-        # Extract insights from the analysis text
+        response_text = await self._call_o3_mini(prompt)
+        analysis_text = response_text.strip()
         insights = self._extract_insights(analysis_text)
-        
-        return {
-            "analysis": analysis_text,
-            "insights": insights
-        }
+        return {"analysis": analysis_text, "insights": insights}
 
     def _extract_insights(self, analysis_text: str) -> List[str]:
-        """
-        Basic extraction of bullet points or lines from the analysis text.
-        """
         lines = analysis_text.split("\n")
         insights = []
         for line in lines:
             line = line.strip()
-            if (
-                line.startswith("-") or line.startswith("*") or 
-                line.startswith("•") or (len(line) > 2 and line[:2].isdigit())
-            ):
+            if (line.startswith("-") or line.startswith("*") or line.startswith("•") or 
+                (len(line) > 2 and line[:2].isdigit())):
                 insights.append(line.lstrip("-*•").strip())
-
         return insights
-        
+
     def _combine_chunk_results(self, chunk_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Merges analysis from multiple chunk results into a single structure.
-        Only combines actual analysis text and insights, not suggestions or placeholders.
-        """
         sorted_chunks = sorted(chunk_results, key=lambda x: x.get("chunk_index", 0))
-        
-        # Only combine actual analysis text, not any suggestions
-        combined_analysis = "\n\n".join([
-            res["analysis"] for res in sorted_chunks 
-            if res.get("analysis", "").strip()
-        ])
-        
-        # Combine insights, removing duplicates
+        combined_analysis = "\n\n".join(res["analysis"] for res in sorted_chunks if res.get("analysis", "").strip())
         combined_insights = []
         for res in sorted_chunks:
-            insights = res.get("insights", [])
-            combined_insights.extend(insight for insight in insights if insight.strip())
-        
-        # Remove duplicates while preserving order
+            combined_insights.extend(insight for insight in res.get("insights", []) if insight.strip())
         unique_insights = list(dict.fromkeys(combined_insights))
-        
-        return {
-            "analysis": combined_analysis,
-            "insights": unique_insights,
-            "chunk_count": len(chunk_results)
-        }
+        return {"analysis": combined_analysis, "insights": unique_insights, "chunk_count": len(chunk_results)}
 
-    def _fix_json_with_gemini_exp(self, malformed_json_str: str) -> str:
-        """
-        Attempts to fix malformed JSON by calling a second Gemini model
-        (gemini-2.0-flash-exp) that is instructed to output valid JSON only.
-        """
-        # Enforce flash-fix rate limit
-        self._enforce_flash_fix_limit()
-        
-        # We can define a separate model name for the "JSON-fixer" step.
-        fix_model_name = "gemini-2.0-flash-exp"
-        
-        # Provide generation settings suitable for a JSON-fixing prompt.
-        # Typically you want a low creativity / temperature so it just
-        # cleans up the JSON and doesn't hallucinate extra structure.
-        fix_generation_config = {
-            "temperature": 0.0,
-            "top_p": 0.0,
-            "top_k": 1,
-            "max_output_tokens": 1024,
-        }
-        
-        fix_model = genai.GenerativeModel(
-            model_name=fix_model_name,
-            generation_config=fix_generation_config
-        )
-        
-        chat_session = fix_model.start_chat(history=[])
-        
-        # In the prompt, we strongly instruct that it must return valid JSON only
-        # with no extra commentary or text.
-        prompt = (
-            "You are an expert at transforming malformed JSON into correct JSON.\n\n"
-            "Your job is to fix any invalid or malformed JSON so it can be parsed.\n"
-            "Output *only* the corrected JSON—no extra commentary or text.\n\n"
-            "Here is the malformed JSON:\n"
-            f"{malformed_json_str}\n\n"
-            "Now return only valid JSON."
-        )
-        
-        response = chat_session.send_message(prompt)
-        return response.text
-
-    def _call_gemini(self, prompt: str, context: str = "") -> str:
-        """Helper method to call Gemini API with logging."""
-        api_logger.info(f"Gemini API Request - Context length: {len(context)}")
-        api_logger.debug(f"Prompt: {prompt}")
-        
-        try:
-            model = self._get_model()
-            chat = model.start_chat(history=[])
-            response = chat.send_message(prompt)
-            
-            api_logger.debug(f"Response: {response.text}")
-            return response.text.strip()
-            
-        except Exception as e:
-            api_logger.error(f"Gemini API error: {str(e)}")
-            raise
-
-    def _identify_knowledge_gaps(self, question: str, current_analysis: str) -> List[Dict[str, Any]]:
-        """
-        Identify missing information and suggest next steps.
-        Skip any suggestions containing placeholder text in brackets.
-        
-        Args:
-            question: The research question being investigated
-            current_analysis: Combined text from search results, explored content, and analysis
-            
-        Returns:
-            List of gap dictionaries, each containing type (search/explore), query/url, and rationale
-        """
+    async def _identify_knowledge_gaps(self, question: str, current_analysis: str) -> List[Dict[str, Any]]:
         prompt = (
             "You are an advanced research assistant. Given a research question and current analysis, "
             "identify specific missing information and suggest concrete next steps.\n\n"
             "IMPORTANT RULES:\n"
-            "1. DO NOT use placeholders like [company name] or [person] - only suggest specific, concrete queries/URLs\n"
-            "2. Base your suggestions ONLY on the actual content provided\n"
-            "3. If you can't identify specific gaps, return an empty array\n"
-            "4. Each suggestion must be actionable and clearly related to the research question\n\n"
+            "1. DO NOT use placeholders like [company name] or [person].\n"
+            "2. Base suggestions solely on the provided content.\n"
+            "3. If no specific gaps can be identified, return an empty array.\n"
+            "4. Each suggestion must be actionable and clearly linked to the research question.\n\n"
             f"RESEARCH QUESTION: {question}\n\n"
             f"CURRENT ANALYSIS:\n{current_analysis}\n\n"
-            "Respond with a JSON array of gaps in this format:\n"
-            '[{"type": "search"|"explore", "query"|"url": "specific text", "rationale": "why needed"}]\n'
-            "Return ONLY the JSON array, no other text."
+            "Return a JSON object with a 'gaps' array in this format:\n"
+            "{\"gaps\": [{\"type\": \"search\"|\"explore\", \"query\"|\"url\": \"specific text\", \"rationale\": \"why needed\"}]}"
         )
-        
         try:
-            content_str = self._call_gemini(prompt, current_analysis)
+            response = await self._call_o3_mini(prompt)
+            content_str = response.strip()
             if not content_str:
                 return []
-            
-            # Clean up the response
-            content_str = self._clean_json_response(content_str)
-            
             try:
-                gaps = json.loads(content_str)
-                if not isinstance(gaps, list):
-                    return []
-                
-                # Filter out any gaps with placeholders or invalid structure
+                result = json.loads(content_str)
+                gaps = result.get("gaps", [])
                 filtered_gaps = []
                 for gap in gaps:
                     if not isinstance(gap, dict):
                         continue
-                        
-                    # Validate required fields
                     if "type" not in gap or gap["type"] not in ["search", "explore"]:
                         continue
-                    
-                    # Get the relevant field based on type
                     content_field = "query" if gap["type"] == "search" else "url"
                     if content_field not in gap or "rationale" not in gap:
                         continue
-                    
-                    content_str = gap[content_field]
-                    rationale_str = gap["rationale"]
-                    
-                    # Skip if any field contains placeholders
-                    if (
-                        "[" in content_str or "]" in content_str or 
-                        "[" in rationale_str or "]" in rationale_str
-                    ):
-                        self.logger.warning(
-                            f"Skipping gap with placeholders: {content_str}"
-                        )
+                    if any(x in gap[content_field] or x in gap["rationale"] for x in ("[", "]")):
+                        self.logger.warning(f"Skipping gap with placeholders: {gap}")
                         continue
-                    
                     filtered_gaps.append(gap)
-                
                 return filtered_gaps
-                
             except json.JSONDecodeError:
                 self.logger.error("Failed to parse knowledge gaps JSON response")
                 return []
-                
         except Exception as e:
             self.logger.error(f"Error identifying knowledge gaps: {str(e)}")
             return []
 
     def _clean_json_response(self, content: str) -> str:
-        """Helper to clean up JSON responses from the model."""
         content = content.strip()
-        
-        # Remove markdown code blocks if present
         if content.startswith("```"):
-            start_idx = content.find("\n", content.find("```")) + 1
+            start_idx = content.find("\n") + 1
             end_idx = content.rfind("```")
             if end_idx > start_idx:
                 content = content[start_idx:end_idx].strip()
             else:
                 content = content.replace("```", "").strip()
-            
-        # Remove any "json" language identifier
         content = content.replace("json", "").strip()
-        
         return content
-    
-    def _should_terminate(self, context: ResearchContext) -> bool:
-        """
-        Use Gemini to decide if the research question has been sufficiently answered.
-        """
+
+    async def _should_terminate(self, context: ResearchContext) -> bool:
         analysis_items = context.get_content("main", ContentType.ANALYSIS)
-        if len(analysis_items) < 3:  # Need some minimum analysis
+        if len(analysis_items) < 3:
             return False
-
         combined_analysis = "\n".join(
-            str(item.content.get("analysis", "")) for item in analysis_items
+            str(item.content.get("analysis", "")) for item in analysis_items if isinstance(item.content, dict)
         )
-
         prompt = (
-            "You are an advanced research assistant. Given a research question and the current analysis, "
+            "You are an advanced research assistant. Given a research question and current analysis, "
             "determine if the question has been sufficiently answered.\n\n"
             f"QUESTION: {context.initial_question}\n\n"
             f"CURRENT ANALYSIS:\n{combined_analysis}\n\n"
-            "Respond with a single word: YES if the question is sufficiently answered, NO if not."
+            "Respond with a single word: YES if answered, NO if not."
         )
-        
         try:
-            answer = self._call_gemini(prompt, combined_analysis)
+            answer = await self._call_o3_mini(prompt, combined_analysis)
             return answer.strip().upper() == "YES"
         except Exception:
             return False
 
-    def _filter_relevant_urls(
-        self, 
-        urls: List[str], 
-        context: ResearchContext
-    ) -> List[tuple[str, float]]:
-        """
-        Filter and score URLs based on relevance to the research question.
-        Returns: List of (url, relevance_score) tuples.
-        """
+    async def _filter_relevant_urls(self, urls: List[str], context: ResearchContext) -> List[tuple]:
         if not urls:
             return []
-            
-        # Batch URLs for efficient processing
         batch_size = 5
         url_batches = [urls[i:i + batch_size] for i in range(0, len(urls), batch_size)]
         relevant_urls = []
-        
         for batch in url_batches:
             prompt = (
                 "You are an expert at determining URL relevance for research questions.\n"
@@ -1362,60 +994,41 @@ class ReasoningAgent(BaseAgent):
                 f"RESEARCH QUESTION: {context.initial_question}\n\n"
                 "URLs to evaluate:\n"
             )
-            
             for url in batch:
                 domain = urlparse(url).netloc
                 path = urlparse(url).path
                 prompt += f"- {domain}{path}\n"
-                
             prompt += (
                 "\nRespond with a JSON array of scores in this format:\n"
                 "[{\"url\": \"...\", \"score\": 0.X, \"reason\": \"...\"}]\n"
                 "ONLY return the JSON array, no other text."
             )
-            
             try:
-                content = self._call_gemini(prompt)
-                
-                # Clean markdown formatting if present
+                content = await self._call_o3_mini(prompt)
                 if content.startswith("```"):
                     content = content[content.find("\n")+1:content.rfind("```")].strip()
                 content = content.replace("json", "").strip()
-                
                 scores = json.loads(content)
-                
                 for score_obj in scores:
                     url = score_obj["url"]
                     score = float(score_obj["score"])
                     relevant_urls.append((url, score))
-                    
             except Exception as e:
                 logger.error(f"Error scoring URLs: {str(e)}")
-                # Fall back to basic keyword matching for this batch
                 for url in batch:
                     relevance = self._basic_url_relevance(url, context.initial_question)
                     relevant_urls.append((url, relevance))
-                
         return sorted(relevant_urls, key=lambda x: x[1], reverse=True)
 
     def _basic_url_relevance(self, url: str, question: str) -> float:
-        """
-        Basic fallback method for URL relevance when LLM scoring fails.
-        Returns a score between 0.0 and 1.0.
-        """
-        # Extract keywords from question
+        import re
+        from urllib.parse import urlparse
         keywords = set(re.findall(r'\w+', question.lower()))
-        
-        # Parse URL components
         parsed = urlparse(url)
         domain_parts = parsed.netloc.lower().split('.')
         path_parts = parsed.path.lower().split('/')
-        
-        # Count keyword matches in domain and path
         domain_matches = sum(1 for part in domain_parts if part in keywords)
         path_matches = sum(1 for part in path_parts if part in keywords)
-        
-        # Weight domain matches more heavily than path matches
         score = (domain_matches * 0.6 + path_matches * 0.4) / max(len(keywords), 1)
         return min(max(score, 0.0), 1.0)
 ```
@@ -1425,7 +1038,7 @@ class ReasoningAgent(BaseAgent):
 ```python
 """
 Search agent for managing Perplexity-based research queries.
-Handles query refinement, result tracking, and search history management.
+Now fully asynchronous.
 """
 
 from typing import List, Dict, Any, Optional
@@ -1440,47 +1053,30 @@ from .context import ResearchContext, ContentType, ContentItem
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class SearchQuery:
-    """
-    Represents a search query and its context.
-    
-    Attributes:
-        query: The search query text
-        priority: Query priority (0-1)
-        rationale: Why the query was generated
-        parent_query_id: If nested
-        timestamp: When created
-    """
     query: str
     priority: float
     rationale: str
     parent_query_id: Optional[str] = None
     timestamp: float = time.time()
 
+
 class SearchAgent(BaseAgent):
     """
     Agent responsible for search operations using Perplexity.
-    Dedup logic is now handled in the Orchestrator,
-    so we do not repeat queries from here if orchestrator filters them.
     """
-    
+
     def __init__(self, perplexity_client: PerplexityClient, config: Optional[Dict[str, Any]] = None):
         super().__init__("search", config)
         self.perplexity = perplexity_client
         self.query_history: Dict[str, SearchQuery] = {}
-        
         self.max_queries = self.config.get("max_queries", 5)
         self.min_priority = self.config.get("min_priority", 0.3)
-        
-    def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
-        """
-        The SearchAgent might propose an initial search if no search results exist,
-        but you might also let ReasoningAgent handle it. Minimizing duplication is wise.
-        """
+
+    async def analyze(self, context: ResearchContext) -> List[ResearchDecision]:
         decisions = []
-        
-        # If no search results at all, we do an initial question
         search_results = context.get_content("main", ContentType.SEARCH_RESULT)
         if not search_results and len(self.query_history) == 0:
             decisions.append(
@@ -1495,27 +1091,22 @@ class SearchAgent(BaseAgent):
                 )
             )
         return decisions
-        
+
     def can_handle(self, decision: ResearchDecision) -> bool:
         return decision.decision_type == DecisionType.SEARCH
-        
-    def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
-        self._enforce_rate_limit()
-        
-        start_time = time.time()
+
+    async def execute_decision(self, decision: ResearchDecision) -> Dict[str, Any]:
+        await self._enforce_rate_limit()
+        start_time = asyncio.get_event_loop().time()
         success = False
         results = {}
-        
         try:
             query = decision.context.get("query", "").strip()
             if not query:
                 rprint("[yellow]SearchAgent: Empty query, skipping[/yellow]")
                 results = {"content": "", "urls": []}
             else:
-                # Execute search
-                results = self.perplexity.search(query)
-                
-                # Add to query history
+                results = await self.perplexity.search(query)
                 query_id = str(len(self.query_history) + 1)
                 self.query_history[query_id] = SearchQuery(
                     query=query,
@@ -1524,17 +1115,14 @@ class SearchAgent(BaseAgent):
                     parent_query_id=decision.context.get("parent_query_id")
                 )
                 results["query_id"] = query_id
-            
             success = True
             rprint(f"[green]SearchAgent: Search completed for query: '{query}'[/green]")
-            
         except Exception as e:
             rprint(f"[red]SearchAgent error: {str(e)}[/red]")
             results = {"error": str(e), "urls": []}
         finally:
-            execution_time = time.time() - start_time
+            execution_time = asyncio.get_event_loop().time() - start_time
             self.log_decision(decision, success, execution_time)
-        
         return results
 ```
 
@@ -1543,8 +1131,7 @@ class SearchAgent(BaseAgent):
 ```python
 """
 Firecrawl client for web scraping functionality.
-This module handles interactions with the Firecrawl API for extracting content
-from web pages and processing the extracted data.
+Now uses asyncio.to_thread to wrap blocking calls.
 """
 
 import os
@@ -1553,51 +1140,34 @@ from dotenv import load_dotenv
 from rich import print as rprint
 from firecrawl import FirecrawlApp
 import logging
+import asyncio
 
 load_dotenv()
 
-# Get API logger
 api_logger = logging.getLogger('api.firecrawl')
+
 
 class FirecrawlClient:
     def __init__(self):
         self.api_key = os.getenv("FIRECRAWL_API_KEY")
         if not self.api_key:
             raise ValueError("FIRECRAWL_API_KEY not found in environment variables")
-        
         self.app = FirecrawlApp(api_key=self.api_key)
         self.logger = logging.getLogger(__name__)
-        
-    def extract_content(self, url: str) -> Dict[str, Any]:
+
+    async def extract_content(self, url: str) -> Dict[str, Any]:
         """
-        Extract content from a webpage using Firecrawl API.
-        
-        Args:
-            url: The URL to scrape
-            
-        Returns:
-            Dict containing extracted content and metadata
+        Asynchronously extract content from a webpage.
         """
         api_logger.info(f"Firecrawl API Request - URL: {url}")
-        
         try:
-            # Ensure URL has protocol
             if not url.startswith(('http://', 'https://')):
                 url = 'https://' + url
                 api_logger.debug(f"Added https:// protocol to URL: {url}")
-            
-            # Make the request to scrape the URL
-            result = self.app.scrape_url(
-                url,
-                params={
-                    'formats': ['markdown'],
-                }
-            )
-            
+            result = await asyncio.to_thread(self.app.scrape_url, url, params={'formats': ['markdown']})
             processed_result = self._process_extracted_content(result.get('data', {}), url)
             api_logger.debug(f"Processed content from {url}: {len(processed_result.get('text', ''))} chars")
             return processed_result
-            
         except Exception as e:
             api_logger.error(f"Firecrawl API request failed for {url}: {str(e)}")
             return {
@@ -1608,71 +1178,42 @@ class FirecrawlClient:
                     "error": str(e)
                 }
             }
-            
+
     def _process_extracted_content(self, data: Dict[str, Any], original_url: str) -> Dict[str, Any]:
-        """
-        Process and clean the extracted content.
-        
-        Args:
-            data: Raw API response data
-            original_url: The original URL that was scraped
-            
-        Returns:
-            Processed and cleaned content
-        """
         metadata = data.get("metadata", {})
         markdown_content = data.get("markdown", "")
-        
         processed = {
             "title": metadata.get("title", metadata.get("ogTitle", "")),
             "text": markdown_content,
             "metadata": {
                 "url": metadata.get("sourceURL", original_url),
                 "author": metadata.get("author", ""),
-                "published_date": "",  # Firecrawl doesn't provide this directly
+                "published_date": "",
                 "domain": metadata.get("ogSiteName", ""),
                 "word_count": len(markdown_content.split()) if markdown_content else 0,
                 "language": metadata.get("language", ""),
                 "status_code": metadata.get("statusCode", 200)
             }
         }
-        
-        # Clean and format the text if needed
         if processed["text"]:
             processed["text"] = self._clean_text(processed["text"])
             api_logger.debug(f"Cleaned text for {original_url}: {len(processed['text'])} chars")
         else:
             api_logger.warning(f"No text content extracted from {original_url}")
-        
         return processed
-        
+
     def _clean_text(self, text: str) -> str:
-        """
-        Clean and format extracted text.
-        
-        Args:
-            text: Raw extracted text
-            
-        Returns:
-            Cleaned and formatted text
-        """
         if not text:
             return ""
-            
-        # Remove extra whitespace while preserving markdown formatting
         lines = text.split("\n")
         cleaned_lines = []
-        
         for line in lines:
-            # Preserve markdown headings and lists
             if line.strip().startswith(("#", "-", "*", "1.", ">")):
                 cleaned_lines.append(line)
             else:
-                # Clean normal text lines
                 cleaned = " ".join(line.split())
                 if cleaned:
                     cleaned_lines.append(cleaned)
-        
         return "\n\n".join(cleaned_lines)
 ```
 
@@ -1681,7 +1222,7 @@ class FirecrawlClient:
 ```python
 """
 Main entry point for the multi-agent research system.
-Provides a command-line interface for conducting research using specialized agents.
+Now uses an async main loop.
 """
 
 import os
@@ -1696,17 +1237,15 @@ from rich.panel import Panel
 from rich.markdown import Markdown
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import WordCompleter
-import time
+import asyncio
 
 from .orchestrator import ResearchOrchestrator
 from .output_manager import OutputManager
 
-# Clear existing handlers to avoid duplicate logs
+# Logging configuration
 root_logger = logging.getLogger()
 for handler in root_logger.handlers[:]:
     root_logger.removeHandler(handler)
-
-# Configure main application logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -1715,8 +1254,6 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
-
-# Configure API logging
 api_logger = logging.getLogger('api')
 api_logger.setLevel(logging.DEBUG)
 api_handler = logging.FileHandler('rat_api.log', mode='w')
@@ -1724,61 +1261,51 @@ api_handler.setFormatter(
     logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 )
 api_logger.addHandler(api_handler)
-
-# Configure Firecrawl API logging
 firecrawl_logger = logging.getLogger('api.firecrawl')
 firecrawl_logger.setLevel(logging.DEBUG)
 firecrawl_logger.addHandler(api_handler)
 firecrawl_logger.propagate = False
-
-# Ensure API logger doesn't propagate to root logger
 api_logger.propagate = False
 
 logger = logging.getLogger(__name__)
 console = Console()
 
+
 def load_config() -> Dict[str, Any]:
-    """Load configuration from environment variables."""
     load_dotenv()
-    
     config = {
         'max_iterations': int(os.getenv('MAX_ITERATIONS', '5')),
         'min_new_content': int(os.getenv('MIN_NEW_CONTENT', '3')),
         'min_confidence': float(os.getenv('MIN_CONFIDENCE', '0.7')),
-        
-        # Limit search to 100 requests/min
         'search_config': {
             'max_results': int(os.getenv('MAX_SEARCH_RESULTS', '10')),
             'min_relevance': float(os.getenv('MIN_SEARCH_RELEVANCE', '0.6')),
             'api_key': os.getenv('PERPLEXITY_API_KEY'),
             'max_workers': int(os.getenv('MAX_PARALLEL_SEARCHES', '10')),
-            'rate_limit': int(os.getenv('SEARCH_RATE_LIMIT', '100'))  # 100 requests/min for Perplexity
+            'rate_limit': int(os.getenv('SEARCH_RATE_LIMIT', '100'))
         },
-        # Limit Firecrawl to 50 requests/min
         'explore_config': {
             'max_urls': int(os.getenv('MAX_URLS', '20')),
             'min_priority': float(os.getenv('MIN_URL_PRIORITY', '0.5')),
             'allowed_domains': json.loads(os.getenv('ALLOWED_DOMAINS', '[]')),
             'api_key': os.getenv('FIRECRAWL_API_KEY'),
             'max_workers': int(os.getenv('MAX_PARALLEL_EXPLORES', '10')),
-            'rate_limit': int(os.getenv('EXPLORE_RATE_LIMIT', '50'))  # 50 requests/min for Firecrawl
+            'rate_limit': int(os.getenv('EXPLORE_RATE_LIMIT', '50'))
         },
-        # Limit Gemini "thinking" to 10 requests/min
-        # and "flash" JSON-fixer also 10/min
         'reason_config': {
             'max_chunk_size': int(os.getenv('MAX_CHUNK_SIZE', '4000')),
             'min_confidence': float(os.getenv('MIN_ANALYSIS_CONFIDENCE', '0.7')),
             'max_workers': int(os.getenv('MAX_PARALLEL_REASON', '5')),
-            'rate_limit': int(os.getenv('REASON_RATE_LIMIT', '10')),  # 10 requests/min for main Gemini
-            'flash_fix_rate_limit': int(os.getenv('FLASH_FIX_RATE_LIMIT', '10')),  # 10/min for JSON-fixing
+            'rate_limit': int(os.getenv('REASON_RATE_LIMIT', '10')),
+            'flash_fix_rate_limit': int(os.getenv('FLASH_FIX_RATE_LIMIT', '10')),
             'api_key': os.getenv('GEMINI_API_KEY'),
             'gemini_timeout': int(os.getenv('GEMINI_TIMEOUT', '180'))
         }
     }
     return config
 
+
 def display_welcome():
-    """Display welcome message and system information."""
     welcome_text = """
 # RAT - Retrieval Augmented Thinking
 
@@ -1792,8 +1319,8 @@ Enter your research question below, or type 'help' for more information.
 """
     console.print(Panel(Markdown(welcome_text), title="Welcome", border_style="blue"))
 
+
 def display_help():
-    """Display help information."""
     help_text = """
 ## Available Commands
 
@@ -1811,83 +1338,371 @@ def display_help():
 """
     console.print(Panel(Markdown(help_text), title="Help", border_style="green"))
 
-def run_research(question: str, config: Dict[str, Any]) -> None:
-    """Run research with the given question."""
+
+async def run_research(question: str, config: Dict[str, Any]) -> None:
     orchestrator = ResearchOrchestrator(config)
-    results = orchestrator.start_research(question)
-    
+    results = await orchestrator.start_research(question)
     if "error" in results:
         console.print(f"[red]Research error: {results['error']}[/red]")
     else:
         console.print(Panel(Markdown(results["paper"]), title="Research Results", border_style="green"))
 
-def main():
-    """Main entry point for the research system."""
+
+async def main_async():
     import argparse
-    
     parser = argparse.ArgumentParser(description="RAT - Retrieval Augmented Thinking")
-    parser.add_argument("--interactive", "-i", action="store_true", 
-                       help="Start in interactive mode")
-    parser.add_argument("question", nargs="?", 
-                       help="Research question (if not using interactive mode)")
-    
+    parser.add_argument("--interactive", "-i", action="store_true",
+                        help="Start in interactive mode")
+    parser.add_argument("question", nargs="?",
+                        help="Research question (if not using interactive mode)")
     args = parser.parse_args()
     config = load_config()
-    
     if args.interactive:
         display_welcome()
         commands = WordCompleter(['research', 'config', 'metrics', 'help', 'exit'])
         orchestrator: Optional[ResearchOrchestrator] = None
-        
         while True:
             try:
                 user_input = prompt('RAT> ', completer=commands).strip()
-                
                 if not user_input:
                     continue
-                    
                 if user_input.lower() == 'exit':
                     console.print("[yellow]Exiting research system...[/yellow]")
                     break
-                    
                 if user_input.lower() == 'help':
                     display_help()
                     continue
-                    
                 if user_input.lower() == 'config':
                     console.print(Panel(json.dumps(config, indent=2), title="Configuration", border_style="cyan"))
                     continue
-                    
                 if user_input.lower() == 'metrics' and orchestrator:
                     metrics = orchestrator._calculate_metrics(time.time())
                     console.print(Panel(json.dumps(metrics, indent=2), title="Research Metrics", border_style="magenta"))
                     continue
-                    
                 if user_input.lower().startswith('research '):
                     question = user_input[9:].strip()
                     if not question:
                         console.print("[red]Please provide a research question.[/red]")
                         continue
-                    
-                    run_research(question, config)
+                    await run_research(question, config)
                     continue
-                    
                 console.print("[red]Unknown command. Type 'help' for available commands.[/red]")
-                
             except KeyboardInterrupt:
                 console.print("\n[yellow]Operation cancelled. Type 'exit' to quit.[/yellow]")
                 continue
-                
             except Exception as e:
                 console.print(f"[red]Error: {str(e)}[/red]")
                 continue
     else:
         if not args.question:
             parser.error("Research question is required when not in interactive mode")
-        run_research(args.question, config)
+        await run_research(args.question, config)
+
+
+def main():
+    asyncio.run(main_async())
+
 
 if __name__ == '__main__':
     main()
+```
+
+## rat/research/manager.py
+
+```python
+"""
+Manager for coordinating the multi-agent research workflow.
+Now fully asynchronous.
+"""
+
+import json
+import time
+import logging
+from asyncio import gather, create_task
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+import asyncio
+from openai import OpenAI
+
+from rat.research.agents.search import SearchAgent
+from rat.research.agents.explore import ExploreAgent
+from rat.research.agents.reason import ReasoningAgent
+from rat.research.agents.base import ResearchDecision, DecisionType
+from rat.research.agents.context import ResearchContext, ContentType, ContentItem
+from rat.research.perplexity_client import PerplexityClient
+from rat.research.firecrawl_client import FirecrawlClient
+from rat.research.output_manager import OutputManager
+
+logger = logging.getLogger(__name__)
+
+
+class AgentTask:
+    """
+    Wrapper for an agent decision execution.
+    """
+    def __init__(self, decision: ResearchDecision, agent, callback):
+        self.decision = decision
+        self.agent = agent
+        self.callback = callback
+
+    async def run(self):
+        result = await self.agent.execute_decision(self.decision)
+        self.callback(self.decision, result)
+        return result
+
+
+class ResearchManager:
+    """
+    Central manager for the multi-agent research process.
+    """
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        self.config = config or {}
+        self.perplexity = PerplexityClient()
+        self.firecrawl = FirecrawlClient()
+        self.search_agent = SearchAgent(self.perplexity, self.config.get("search_config", {}))
+        self.explore_agent = ExploreAgent(self.firecrawl, self.config.get("explore_config", {}))
+        self.reason_agent = ReasoningAgent(self.config.get("reason_config", {}))
+        self.output_manager = OutputManager()
+        self.max_iterations = self.config.get("max_iterations", 5)
+        self.current_context: Optional[ResearchContext] = None
+        self.research_dir: Optional[Path] = None
+        self.previous_searches = set()
+
+    async def start_research(self, question: str) -> Dict[str, Any]:
+        start_time = time.time()
+        self.research_dir = self.output_manager.create_research_dir(question)
+        self.current_context = ResearchContext(initial_question=question)
+        self.persist_context()
+        iteration = 0
+        while iteration < self.max_iterations:
+            iteration += 1
+            logger.info(f"Starting iteration {iteration}")
+            decisions = self.collect_decisions()
+            if not decisions:
+                logger.info("No new decisions, terminating research")
+                break
+            if any(d.decision_type == DecisionType.TERMINATE for d in decisions):
+                logger.info("Terminate decision received")
+                break
+            await self.dispatch_decisions(decisions, iteration)
+            self.persist_context()
+            if self._should_terminate():
+                logger.info("Termination condition met based on context")
+                break
+        final_output = await self._generate_final_output()
+        total_time = time.time() - start_time
+        final_output["metrics"] = {
+            "total_time": total_time,
+            "iterations": iteration
+        }
+        if self.research_dir:
+            self.output_manager.save_research_paper(self.research_dir, final_output)
+        return final_output
+
+    def collect_decisions(self) -> List[ResearchDecision]:
+        decisions = []
+        try:
+            reason_decisions = asyncio.run(self.reason_agent.analyze(self.current_context))
+        except Exception as e:
+            logger.error(f"Error in reason agent analysis: {e}")
+            reason_decisions = []
+        try:
+            search_decisions = asyncio.run(self.search_agent.analyze(self.current_context))
+        except Exception as e:
+            logger.error(f"Error in search agent analysis: {e}")
+            search_decisions = []
+        try:
+            explore_decisions = asyncio.run(self.explore_agent.analyze(self.current_context))
+        except Exception as e:
+            logger.error(f"Error in explore agent analysis: {e}")
+            explore_decisions = []
+        decisions.extend(reason_decisions)
+        decisions.extend(search_decisions)
+        decisions.extend(explore_decisions)
+        filtered = []
+        for d in decisions:
+            if d.decision_type == DecisionType.SEARCH:
+                query = d.context.get("query", "").strip()
+                if query in self.previous_searches:
+                    logger.info(f"Skipping duplicate search: {query}")
+                    continue
+                else:
+                    self.previous_searches.add(query)
+            filtered.append(d)
+        filtered.sort(key=lambda d: d.priority, reverse=True)
+        return filtered
+
+    async def dispatch_decisions(self, decisions: List[ResearchDecision], iteration: int):
+        tasks = []
+        for decision in decisions:
+            if decision.decision_type == DecisionType.TERMINATE:
+                continue
+            agent = self._select_agent(decision)
+            if not agent:
+                continue
+            task = AgentTask(decision, agent, self.update_context_with_result)
+            tasks.append(create_task(task.run()))
+        if tasks:
+            await gather(*tasks)
+
+    def update_context_with_result(self, decision: ResearchDecision, result: Dict[str, Any]):
+        content_item = self._create_content_item(decision, result)
+        if content_item and self.current_context:
+            try:
+                self.current_context.add_content("main", content_item=content_item)
+            except Exception as e:
+                logger.error(f"Error updating context: {e}")
+
+    def _create_content_item(self, decision: ResearchDecision, result: Dict[str, Any]) -> ContentItem:
+        if decision.decision_type == DecisionType.SEARCH:
+            content_str = result.get("content", "")
+            urls = result.get("urls", [])
+            token_count = self.current_context._estimate_tokens(content_str)
+            return ContentItem(
+                content_type=ContentType.SEARCH_RESULT,
+                content=content_str,
+                metadata={"decision_type": decision.decision_type.value, "urls": urls},
+                token_count=token_count,
+                priority=decision.priority
+            )
+        else:
+            if isinstance(result, dict):
+                content_str = result.get("analysis", json.dumps(result))
+            else:
+                content_str = str(result)
+            token_count = self.current_context._estimate_tokens(content_str)
+            content_type = (ContentType.EXPLORED_CONTENT if decision.decision_type == DecisionType.EXPLORE 
+                            else ContentType.ANALYSIS)
+            return ContentItem(
+                content_type=content_type,
+                content=result,
+                metadata={"decision_type": decision.decision_type.value},
+                token_count=token_count,
+                priority=decision.priority
+            )
+
+    def _select_agent(self, decision: ResearchDecision):
+        if decision.decision_type == DecisionType.SEARCH:
+            return self.search_agent
+        elif decision.decision_type == DecisionType.EXPLORE:
+            return self.explore_agent
+        elif decision.decision_type == DecisionType.REASON:
+            return self.reason_agent
+        else:
+            return None
+
+    def _should_terminate(self) -> bool:
+        if self.current_context:
+            contents = self.current_context.get_content("main")
+            return len(contents) >= self.config.get("min_new_content", 3)
+        return False
+
+    def persist_context(self):
+        if self.current_context and self.research_dir:
+            context_file = self.research_dir / "research_context.json"
+            self.current_context.save_to_file(str(context_file))
+            logger.info(f"Context persisted to {context_file}")
+
+    async def _generate_comprehensive_markdown(self) -> str:
+        search_items = self.current_context.get_content("main", ContentType.SEARCH_RESULT)
+        explored_items = self.current_context.get_content("main", ContentType.EXPLORED_CONTENT)
+        analysis_items = self.current_context.get_content("main", ContentType.ANALYSIS)
+        corpus = []
+        corpus.append("### Consolidated Research\n")
+        corpus.append("#### Search Results\n")
+        for item in search_items:
+            corpus.append(str(item.content))
+        corpus.append("\n#### Explored Content\n")
+        for item in explored_items:
+            corpus.append(str(item.content))
+        corpus.append("\n#### Analysis\n")
+        for item in analysis_items:
+            if isinstance(item.content, dict):
+                corpus.append(item.content.get("analysis", ""))
+            else:
+                corpus.append(str(item.content))
+        big_text = "\n\n".join(corpus)
+        prompt = (
+            "You are an advanced AI tasked with generating a comprehensive research paper in Markdown. "
+            "Using the following research corpus, produce a detailed, well-structured paper with headings, subheadings, bullet points, and tables if necessary.\n\n"
+            "RESEARCH CORPUS:\n"
+            f"{big_text}\n\n"
+            "Please produce the final research paper in Markdown:"
+        )
+        
+        # Use the new OpenAI API format
+        client = OpenAI()
+        response = client.chat.completions.create(
+            model="o3-mini",
+            messages=[{"role": "user", "content": prompt}],
+            reasoning_effort="high",
+            max_completion_tokens=50000
+        )
+        final_markdown = response.choices[0].message.content.strip()
+        return final_markdown
+
+    async def _generate_final_output(self) -> Dict[str, Any]:
+        comprehensive_md = await self._generate_comprehensive_markdown()
+        if self.research_dir:
+            pdf_path = self.research_dir / "research_paper.pdf"
+            await self._convert_markdown_to_pdf(comprehensive_md, pdf_path)
+        return {
+            "paper": comprehensive_md,
+            "title": self.current_context.initial_question,
+            "sources": []
+        }
+
+    async def _convert_markdown_to_pdf(self, markdown_text: str, out_path: Path):
+        import markdown
+        from weasyprint import HTML
+        html_content = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; max-width: 800px; margin: 0 auto; padding: 2em; }}
+                h1 {{ color: #2c3e50; border-bottom: 2px solid #eee; }}
+                h2 {{ color: #34495e; margin-top: 2em; }}
+                h3 {{ color: #7f8c8d; }}
+                code {{ background: #f8f9fa; padding: 0.2em 0.4em; border-radius: 3px; }}
+                pre {{ background: #f8f9fa; padding: 1em; border-radius: 5px; overflow-x: auto; }}
+                blockquote {{ border-left: 4px solid #ddd; margin: 0; padding-left: 1em; color: #666; }}
+                table {{ border-collapse: collapse; width: 100%; margin: 1em 0; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #f8f9fa; }}
+            </style>
+        </head>
+        <body>
+            {markdown.markdown(markdown_text, extensions=['fenced_code', 'tables'])}
+        </body>
+        </html>
+        """
+        HTML(string=html_content).write_pdf(str(out_path))
+
+    def _calculate_metrics(self, total_time: float) -> Dict[str, Any]:
+        metrics = {
+            "total_time": total_time,
+            "iterations": len(self.iterations),
+            "total_decisions": sum(len(it.decisions_made) for it in self.iterations),
+            "total_content": sum(len(it.content_added) for it in self.iterations),
+            "agent_metrics": self._get_agent_metrics()
+        }
+        metrics["iterations_data"] = [
+            {
+                "number": it.iteration_number,
+                "time": it.metrics["iteration_time"],
+                "decisions": len(it.decisions_made),
+                "content": len(it.content_added)
+            }
+            for it in self.iterations
+        ]
+        return metrics
+
+    def _get_agent_metrics(self) -> Dict[str, Any]:
+        return {
+            "search": self.search_agent.get_metrics(),
+            "explore": self.explore_agent.get_metrics(),
+            "reason": self.reason_agent.get_metrics()
+        }
 ```
 
 ## rat/research/orchestrator.py
@@ -1895,72 +1710,50 @@ if __name__ == '__main__':
 ```python
 """
 Orchestrator for coordinating the multi-agent research workflow.
-Manages agent interactions, research flow, and data persistence.
-Supports parallel execution of decisions by type.
+Now fully asynchronous.
 """
 
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
 import json
 import time
 import logging
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
+import asyncio
 from rich import print as rprint
 from pathlib import Path
-import textwrap
-from weasyprint import HTML
 import markdown
+from weasyprint import HTML
+import openai
 
-from .agents.search import SearchAgent
-from .agents.explore import ExploreAgent
-from .agents.reason import ReasoningAgent
-from .perplexity_client import PerplexityClient
-from .firecrawl_client import FirecrawlClient
-from .output_manager import OutputManager
-from .agents.base import ResearchDecision, DecisionType
-from .agents.context import ResearchContext, ContentType, ContentItem
+from rat.research.agents.search import SearchAgent
+from rat.research.agents.explore import ExploreAgent
+from rat.research.agents.reason import ReasoningAgent
+from rat.research.perplexity_client import PerplexityClient
+from rat.research.firecrawl_client import FirecrawlClient
+from rat.research.output_manager import OutputManager
+from rat.research.agents.base import ResearchDecision, DecisionType
+from rat.research.agents.context import ResearchContext, ContentType, ContentItem
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class ResearchIteration:
-    """
-    Represents a single iteration of the research process.
-    
-    Attributes:
-        iteration_number: Current iteration number
-        decisions_made: List of decisions made
-        content_added: New content items added
-        metrics: Performance metrics for this iteration
-        timestamp: float - when the iteration occurred
-    """
     iteration_number: int
     decisions_made: List[ResearchDecision]
     content_added: List[ContentItem]
     metrics: Dict[str, Any]
     timestamp: float = time.time()
 
+
 class ResearchOrchestrator:
     """
     Coordinates the multi-agent research workflow.
-    
-    Manages agent interactions, research flow, and ensures all components
-    work together effectively. Supports parallel execution of decisions.
     """
-    
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """
-        Initialize the research orchestrator.
-        
-        Args:
-            config: Optional configuration parameters
-        """
         self.config = config or {}
-        
-        # Initialize clients
         self.perplexity = PerplexityClient()
         self.firecrawl = FirecrawlClient()
-        
-        # Initialize agents with concurrency + rate limits
         self.search_agent = SearchAgent(
             self.perplexity,
             {
@@ -1985,157 +1778,78 @@ class ResearchOrchestrator:
                 "flash_fix_rate_limit": self.config.get("flash_fix_rate_limit", 10)
             }
         )
-        
-        # Initialize output manager
         self.output_manager = OutputManager()
-        
-        # High-level orchestrator config
         self.max_iterations = self.config.get("max_iterations", 5)
         self.min_new_content = self.config.get("min_new_content", 1)
         self.min_confidence = self.config.get("min_confidence", 0.7)
-        
-        # State tracking
         self.current_context: Optional[ResearchContext] = None
         self.iterations: List[ResearchIteration] = []
         self.research_dir: Optional[Path] = None
-        
-        # Keep track of previously executed search queries to avoid duplicates
         self.previous_searches = set()
-        
-    def start_research(self, question: str) -> Dict[str, Any]:
-        """
-        Start a new research process.
-        
-        Args:
-            question: Research question to investigate
-            
-        Returns:
-            Research results and metrics
-        """
+
+    async def start_research(self, question: str) -> Dict[str, Any]:
         start_time = time.time()
-        
-        try:
-            # Create research directory
-            self.research_dir = self.output_manager.create_research_dir(question)
-            
-            # Initialize research context
-            self.current_context = ResearchContext(initial_question=question)
-            
-            # Main research loop
-            iteration = 0
-            while iteration < self.max_iterations:
-                iteration += 1
-                rprint(f"\n[bold cyan]Starting iteration {iteration}[/bold cyan]")
-                
-                # Run one iteration
-                iteration_result = self._run_iteration(iteration)
-                self.iterations.append(iteration_result)
-                
-                # Check if we should continue
-                if self._should_terminate(iteration_result):
-                    break
-                    
-            # Generate final output
-            results = self._generate_final_output()
-            
-            # Save results
-            if self.research_dir:
-                self.output_manager.save_research_paper(self.research_dir, results)
-            
-            # Calculate overall metrics
-            total_time = time.time() - start_time
-            results["metrics"] = self._calculate_metrics(total_time)
-            
-            return results
-            
-        except Exception as e:
-            rprint(f"[red]Research error: {str(e)}[/red]")
-            return {
-                "error": str(e),
-                "paper": "Error occurred during research",
-                "metrics": {
-                    "error": str(e),
-                    "total_time": time.time() - start_time
-                }
-            }
-            
-    def _run_iteration(self, iteration_number: int) -> ResearchIteration:
-        """
-        Run one iteration of the research process.
-        The ReasoningAgent is the main driver, deciding next steps.
-        Other agents can also propose decisions.
-        """
+        self.research_dir = self.output_manager.create_research_dir(question)
+        self.current_context = ResearchContext(initial_question=question)
+        iteration = 0
+        while iteration < self.max_iterations:
+            iteration += 1
+            rprint(f"\n[bold cyan]Starting iteration {iteration}[/bold cyan]")
+            iteration_result = await self._run_iteration(iteration)
+            self.iterations.append(iteration_result)
+            if self._should_terminate(iteration_result):
+                break
+        results = await self._generate_final_output()
+        total_time = time.time() - start_time
+        results["metrics"] = self._calculate_metrics(total_time)
+        if self.research_dir:
+            self.output_manager.save_research_paper(self.research_dir, results)
+        return results
+
+    async def _run_iteration(self, iteration_number: int) -> ResearchIteration:
         iteration_start = time.time()
         all_decisions = []
         content_added = []
-        
         try:
-            # 1) ReasoningAgent - the main driver
-            reason_decisions = self.reason_agent.analyze(self.current_context)
-            
-            # If the ReasoningAgent says "terminate", gather that decision and skip everything
+            reason_decisions = await self.reason_agent.analyze(self.current_context)
             if any(d.decision_type == DecisionType.TERMINATE for d in reason_decisions):
                 all_decisions.extend(reason_decisions)
             else:
-                # 2) Also gather decisions from other agents
-                search_decisions = self.search_agent.analyze(self.current_context)
-                explore_decisions = self.explore_agent.analyze(self.current_context)
-                
-                # Combine them all
+                search_decisions = await self.search_agent.analyze(self.current_context)
+                explore_decisions = await self.explore_agent.analyze(self.current_context)
                 all_decisions = reason_decisions + search_decisions + explore_decisions
-            
-            # 3) Sort decisions by priority
             sorted_decisions = sorted(all_decisions, key=lambda d: d.priority, reverse=True)
-            
-            # 4) Execute decisions, skipping duplicates for SEARCH
             for decision in sorted_decisions:
                 if decision.decision_type == DecisionType.TERMINATE:
-                    # If we see a TERMINATE decision, do not continue
                     break
-                
                 agent = self._get_agent_for_decision(decision)
                 if not agent:
                     continue
-                
                 if decision.decision_type == DecisionType.SEARCH:
-                    # Check for duplicates
                     query_str = decision.context.get("query", "").strip()
                     if not query_str:
                         continue
-                    
                     if query_str in self.previous_searches:
                         rprint(f"[yellow]Skipping duplicate search: '{query_str}'[/yellow]")
                         continue
                     else:
                         self.previous_searches.add(query_str)
-                
-                # Now actually execute
                 try:
-                    result = agent.execute_decision(decision)
-                    
-                    # Add results to context if we got any
+                    result = await agent.execute_decision(decision)
                     if result:
-                        content_item = self._create_content_item(
-                            decision=decision,
-                            result=result,
-                            iteration_number=iteration_number
-                        )
+                        content_item = self._create_content_item(decision, result, iteration_number)
                         self.current_context.add_content("main", content_item=content_item)
                         content_added.append(content_item)
-                        
                 except Exception as e:
                     rprint(f"[red]Error executing decision: {str(e)}[/red]")
-                        
         except Exception as e:
             rprint(f"[red]Iteration error: {str(e)}[/red]")
-            
         metrics = {
             "iteration_time": time.time() - iteration_start,
             "decisions_made": len(all_decisions),
             "content_added": len(content_added),
             "agent_metrics": self._get_agent_metrics()
         }
-        
         return ResearchIteration(
             iteration_number=iteration_number,
             decisions_made=all_decisions,
@@ -2143,118 +1857,60 @@ class ResearchOrchestrator:
             metrics=metrics
         )
 
-    def _create_content_item(
-        self,
-        decision: ResearchDecision,
-        result: Dict[str, Any],
-        iteration_number: int
-    ) -> ContentItem:
-        """Helper to create a ContentItem from a decision result."""
+    def _create_content_item(self, decision: ResearchDecision, result: Dict[str, Any], iteration_number: int) -> ContentItem:
         if decision.decision_type == DecisionType.SEARCH:
-            # For search results, extract content and urls
             content_str = result.get('content', '')
             urls = result.get('urls', [])
             token_count = self.current_context._estimate_tokens(content_str)
-            
             return ContentItem(
                 content_type=self._get_content_type(decision),
                 content=content_str,
-                metadata={
-                    "decision_type": decision.decision_type.value,
-                    "iteration": iteration_number,
-                    "urls": urls
-                },
+                metadata={"decision_type": decision.decision_type.value, "iteration": iteration_number, "urls": urls},
                 token_count=token_count,
                 priority=decision.priority
             )
         else:
-            # For other types, handle as before
             content_str = result if isinstance(result, str) else json.dumps(result)
             token_count = self.current_context._estimate_tokens(content_str)
-            
             return ContentItem(
                 content_type=self._get_content_type(decision),
                 content=result,
-                metadata={
-                    "decision_type": decision.decision_type.value,
-                    "iteration": iteration_number
-                },
+                metadata={"decision_type": decision.decision_type.value, "iteration": iteration_number},
                 token_count=token_count,
                 priority=decision.priority
             )
 
     def _should_terminate(self, iteration: ResearchIteration) -> bool:
-        """
-        Decide if we should break out of the loop.
-        Now primarily driven by the ReasoningAgent's TERMINATE decision.
-        """
-        # 1) If there's a TERMINATE decision from the ReasoningAgent
-        terminate_decision = any(
-            d.decision_type == DecisionType.TERMINATE for d in iteration.decisions_made
-        )
+        terminate_decision = any(d.decision_type == DecisionType.TERMINATE for d in iteration.decisions_made)
         if terminate_decision:
             rprint("[green]Terminating: ReasoningAgent indicated completion.[/green]")
             return True
-        
-        # 2) Get fresh decisions from all agents to check if there's more work to do
         try:
-            # Get new decisions from each agent
-            reason_decisions = self.reason_agent.analyze(self.current_context)
-            search_decisions = self.search_agent.analyze(self.current_context)
-            explore_decisions = self.explore_agent.analyze(self.current_context)
-            
-            # Filter out duplicate searches
+            reason_decisions = asyncio.run(self.reason_agent.analyze(self.current_context))
+            search_decisions = asyncio.run(self.search_agent.analyze(self.current_context))
+            explore_decisions = asyncio.run(self.explore_agent.analyze(self.current_context))
             valid_decisions = [
                 d for d in (reason_decisions + search_decisions + explore_decisions)
                 if (d.decision_type != DecisionType.SEARCH or 
                     d.context.get("query", "").strip() not in self.previous_searches)
             ]
-            
             if not valid_decisions:
                 rprint("[yellow]Terminating: No further valid decisions from any agent.[/yellow]")
                 return True
-                
         except Exception as e:
             rprint(f"[red]Error checking for new decisions: {str(e)}[/red]")
-            # On error, continue the research to be safe
             return False
-        
         return False
-        
-    def _gather_agent_decisions(self) -> List[ResearchDecision]:
-        """
-        Gather decisions from all agents.
-        
-        Returns:
-            Combined list of decisions
-        """
-        all_decisions = []
-        
-        # Get decisions from each agent
-        for agent in [
-            self.search_agent,
-            self.explore_agent,
-            self.reason_agent
-        ]:
-            try:
-                decisions = agent.analyze(self.current_context)
-                all_decisions.extend(decisions)
-            except Exception as e:
-                rprint(f"[red]Error getting decisions from {agent.name}: {str(e)}[/red]")
-                
-        return all_decisions
-        
+
     def _get_agent_for_decision(self, decision: ResearchDecision) -> Optional[Any]:
-        """Get the appropriate agent for a given decision type."""
         agent_map = {
             DecisionType.SEARCH: self.search_agent,
             DecisionType.EXPLORE: self.explore_agent,
             DecisionType.REASON: self.reason_agent
         }
         return agent_map.get(decision.decision_type)
-        
+
     def _get_content_type(self, decision: ResearchDecision) -> ContentType:
-        """Map decision types to content types."""
         type_map = {
             DecisionType.SEARCH: ContentType.SEARCH_RESULT,
             DecisionType.EXPLORE: ContentType.EXPLORED_CONTENT,
@@ -2262,95 +1918,67 @@ class ResearchOrchestrator:
             DecisionType.TERMINATE: ContentType.OTHER
         }
         return type_map.get(decision.decision_type, ContentType.OTHER)
-        
-    def _generate_comprehensive_paper_markdown(self, context: ResearchContext) -> str:
-        """
-        Make a second call to Gemini to produce a very thorough Markdown report,
-        using all discovered search results, explored text, and analyses.
-        """
-        # 1) Gather up all final relevant data
+
+    async def _call_o3_mini_for_report(self, prompt: str) -> str:
+        try:
+            response = await openai.ChatCompletion.acreate(
+                model="o3-mini",
+                messages=[{"role": "user", "content": prompt}],
+                reasoning_effort="high",
+                max_completion_tokens=self.reason_agent.max_output_tokens
+            )
+            text = response.choices[0].message.content.strip()
+            if text.startswith("```"):
+                start_idx = text.find("\n") + 1
+                end_idx = text.rfind("```")
+                if end_idx > start_idx:
+                    text = text[start_idx:end_idx].strip()
+                else:
+                    text = text.replace("```", "").strip()
+            return text
+        except Exception as e:
+            logger.error(f"Error in final paper LLM call: {e}")
+            return "## Error generating comprehensive paper"
+
+    async def _generate_comprehensive_paper_markdown(self, context: ResearchContext) -> str:
         search_items = context.get_content("main", ContentType.SEARCH_RESULT)
         explored_items = context.get_content("main", ContentType.EXPLORED_CONTENT)
         analysis_items = context.get_content("main", ContentType.ANALYSIS)
-
-        # Combine them into one big text corpus
         combined_corpus = []
-
         combined_corpus.append("### Final Consolidated Research\n")
         combined_corpus.append("[SEARCH RESULTS]\n")
         for s in search_items:
             combined_corpus.append(str(s.content))
-
         combined_corpus.append("\n[EXPLORED CONTENT]\n")
         for e in explored_items:
             combined_corpus.append(str(e.content))
-
         combined_corpus.append("\n[ANALYSIS TEXT]\n")
         for a in analysis_items:
             if isinstance(a.content, dict):
                 combined_corpus.append(a.content.get("analysis", ""))
             else:
                 combined_corpus.append(str(a.content))
-
         big_text = "\n\n".join(combined_corpus)
-
-        # 2) Build a specialized prompt for the final deep-dive Markdown
-        prompt = textwrap.dedent(f"""
-            You are an advanced AI that just completed a comprehensive multi-step research.
-            Now produce a SINGLE, richly detailed research paper in valid Markdown.
-            Incorporate all relevant facts, context, analysis, and insights from the text below.
-            
-            Provide a thorough, well-structured breakdown:
-            - Large headings
-            - Subheadings
-            - Bullet points
-            - Tables if relevant
-            - Detailed comparisons and references
-
-            Return ONLY Markdown. No extra JSON or placeholders.
-
-            RESEARCH CORPUS:
-            {big_text}
-
-            Please produce the final research paper in Markdown now:
-        """).strip()
-
-        # 3) Make the LLM call using the ReasoningAgent's model
-        final_markdown = self._call_gemini_for_report(prompt)
+        prompt = (
+            "You are an advanced AI that just completed a comprehensive multi-step research.\n"
+            "Now produce a SINGLE, richly detailed research paper in valid Markdown.\n"
+            "Incorporate all relevant facts, context, analysis, and insights from the text below.\n\n"
+            "Provide a thorough, well-structured breakdown:\n"
+            "- Large headings\n"
+            "- Subheadings\n"
+            "- Bullet points\n"
+            "- Tables if relevant\n"
+            "- Detailed comparisons and references\n\n"
+            "Return ONLY Markdown. RULE: ensure that all tables are valid Markdown tables. No extra JSON or placeholders.\n\n"
+            "RESEARCH CORPUS:\n"
+            f"{big_text}\n\n"
+            "Please produce the final research paper in Markdown now:"
+        ).strip()
+        final_markdown = await self._call_o3_mini_for_report(prompt)
         return final_markdown
 
-    def _call_gemini_for_report(self, prompt: str) -> str:
-        """
-        Minimal method to do a single-turn call to the same Gemini model used by ReasoningAgent.
-        Return the raw text (which should be valid Markdown).
-        """
-        try:
-            # Reuse the ReasoningAgent's model for consistency
-            response = self.reason_agent.model.generate_content(prompt)
-            text = response.text.strip()
-            
-            # Clean markdown code blocks if present
-            if text.startswith("```"):
-                # Find the first newline after the opening ```
-                start_idx = text.find("\n") + 1
-                # Find the last ``` and exclude it
-                end_idx = text.rfind("```")
-                if end_idx > start_idx:
-                    text = text[start_idx:end_idx].strip()
-                else:
-                    # If no proper end block found, just remove all ``` markers
-                    text = text.replace("```", "").strip()
-            
-            return text
-        except Exception as e:
-            logger.error(f"Error in final paper LLM call: {e}")
-            return "## Error generating comprehensive paper"
-
-    def _convert_markdown_to_pdf(self, markdown_text: str, out_path: Path):
-        """
-        Convert Markdown to PDF using WeasyPrint.
-        """
-        # Convert MD -> HTML with basic styling
+    async def _convert_markdown_to_pdf(self, markdown_text: str, out_path: Path):
+        import markdown
         html_content = f"""
         <html>
         <head>
@@ -2372,58 +2000,27 @@ class ResearchOrchestrator:
         </body>
         </html>
         """
-        
-        # Write to PDF
         HTML(string=html_content).write_pdf(str(out_path))
 
-    def _generate_final_output(self) -> Dict[str, Any]:
-        """
-        Generate the final research output with both quick summary and comprehensive deep-dive,
-        plus PDF export.
-        """
-        # Get all content by type
-        search_results = self.current_context.get_content("main", ContentType.SEARCH_RESULT)
-        explored_content = self.current_context.get_content("main", ContentType.EXPLORED_CONTENT)
-        analysis = self.current_context.get_content("main", ContentType.ANALYSIS)
-
-        # Generate the comprehensive markdown
-        comprehensive_md = self._generate_comprehensive_paper_markdown(self.current_context)
-
-        # Convert to PDF if we have a research directory
+    async def _generate_final_output(self) -> Dict[str, Any]:
+        comprehensive_md = await self._generate_comprehensive_paper_markdown(self.current_context)
         if self.research_dir:
             pdf_path = self.research_dir / "research_paper.pdf"
-            self._convert_markdown_to_pdf(comprehensive_md, pdf_path)
-
-        # Return the final dict with the comprehensive markdown
+            await self._convert_markdown_to_pdf(comprehensive_md, pdf_path)
         return {
             "paper": comprehensive_md,
             "title": self.current_context.initial_question,
-            "sources": []  # TODO: Extract sources from search results and explored content
+            "sources": []
         }
-        
+
     def _calculate_metrics(self, total_time: float) -> Dict[str, Any]:
-        """
-        Calculate overall research metrics.
-        
-        Args:
-            total_time: Total research time
-            
-        Returns:
-            Dictionary of metrics
-        """
         metrics = {
             "total_time": total_time,
             "iterations": len(self.iterations),
-            "total_decisions": sum(
-                len(it.decisions_made) for it in self.iterations
-            ),
-            "total_content": sum(
-                len(it.content_added) for it in self.iterations
-            ),
+            "total_decisions": sum(len(it.decisions_made) for it in self.iterations),
+            "total_content": sum(len(it.content_added) for it in self.iterations),
             "agent_metrics": self._get_agent_metrics()
         }
-        
-        # Add per-iteration metrics
         metrics["iterations_data"] = [
             {
                 "number": it.iteration_number,
@@ -2433,13 +2030,9 @@ class ResearchOrchestrator:
             }
             for it in self.iterations
         ]
-        
         return metrics
-        
+
     def _get_agent_metrics(self) -> Dict[str, Any]:
-        """
-        Gather metrics from each agent.
-        """
         return {
             "search": self.search_agent.get_metrics(),
             "explore": self.explore_agent.get_metrics(),
@@ -2665,66 +2258,55 @@ class OutputManager:
 ```python
 """
 Perplexity API client for web search functionality.
-Uses the Perplexity API to perform intelligent web searches and extract relevant information.
+Now uses async OpenAI API calls.
 """
 
 import os
 import re
 import json
 import logging
-from openai import OpenAI
+import openai
 from typing import List, Dict, Any
 from rich import print as rprint
 from dotenv import load_dotenv
-import httpx
+import asyncio
 
 load_dotenv()
-
-# Get API logger
 api_logger = logging.getLogger('api.perplexity')
+
 
 class PerplexityClient:
     def __init__(self):
-        self.client = OpenAI(
-            api_key=os.getenv("PERPLEXITY_API_KEY"),
-            base_url="https://api.perplexity.ai"
-        )
-        
-        self.model = "sonar-pro"
+        self.api_key = os.getenv("PERPLEXITY_API_KEY")
+        self.client = openai
+        self.client.api_key = self.api_key
+        self.client.api_base = "https://api.perplexity.ai"
+        self.model = "sonar-reasoning"
         self.system_message = (
             "You are a research assistant helping to find accurate and up-to-date information. "
             "When providing information, always cite your sources in the format [Source: URL]. "
             "Focus on finding specific, factual information and avoid speculation."
         )
-        
-    def search(self, query: str) -> Dict[str, Any]:
+
+    async def search(self, query: str) -> Dict[str, Any]:
         """
-        Perform a web search using the Perplexity API.
-        
-        Args:
-            query: The search query
-            
-        Returns:
-            Dict containing search results and extracted URLs
+        Perform an asynchronous web search.
         """
         api_logger.info(f"Perplexity API Request - Query: {query}")
-        
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+            params = {
+                "model": self.model,
+                "messages": [
                     {"role": "system", "content": self.system_message},
                     {"role": "user", "content": query}
                 ],
-                temperature=0.7,
-                stream=False
-            )
-            
+                "temperature": 0.7,
+                "stream": False
+            }
+            response = await openai.ChatCompletion.acreate(**params)
             content = response.choices[0].message.content
             urls = self._extract_urls(content)
-            
             api_logger.debug(f"Response data: {json.dumps({'content': content, 'urls': urls}, indent=2)}")
-            
             return {
                 "content": content,
                 "urls": urls,
@@ -2734,7 +2316,6 @@ class PerplexityClient:
                     "usage": response.usage
                 }
             }
-            
         except Exception as e:
             api_logger.error(f"Perplexity API error: {str(e)}")
             return {
@@ -2743,48 +2324,25 @@ class PerplexityClient:
                 "query": query,
                 "metadata": {}
             }
-            
+
     def _extract_urls(self, text: str) -> List[str]:
-        """
-        Extract URLs from text, including those in citation format.
-        
-        Args:
-            text: Text to extract URLs from
-            
-        Returns:
-            List of extracted URLs
-        """
-        # Look for URLs in citation format [Source: URL]
-        citation_pattern = r'\[Source: (https?://[^\]]+)\]'
+        citation_pattern = r'$begin:math:display$Source: (https?://[^$end:math:display$]+)\]'
         citation_urls = re.findall(citation_pattern, text)
-        
-        # Also look for raw URLs
         url_pattern = r'https?://\S+'
         raw_urls = re.findall(url_pattern, text)
-        
-        # Combine and deduplicate URLs
         all_urls = list(set(citation_urls + raw_urls))
         return all_urls
 
-    def validate_url(self, url: str) -> bool:
-        """
-        Validate if a URL is accessible and safe to scrape.
-        """
+    async def validate_url(self, url: str) -> bool:
         import requests
         from urllib.parse import urlparse
-        
         try:
-            # Parse URL
             parsed = urlparse(url)
             if not all([parsed.scheme, parsed.netloc]):
                 return False
-                
-            # Check if URL is accessible
-            response = requests.head(url, timeout=5)
-            return response.status_code == 200
-            
+            return await asyncio.to_thread(lambda: requests.head(url, timeout=5).status_code == 200)
         except Exception:
-            return False 
+            return False
 ```
 
 ## rat_agentic.py
@@ -2796,15 +2354,18 @@ Provides a command-line interface for conducting research using the agent-based 
 """
 
 import sys
+import json
 from rich import print as rprint
 from rich.panel import Panel
 from rich.markdown import Markdown
 from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
+from prompt_toolkit.completion import WordCompleter
 from typing import Dict, Any, Optional
-import json
+import asyncio
 
-from rat.research.orchestrator import ResearchOrchestrator
+from rat.research.manager import ResearchManager
+
 
 def create_default_config() -> Dict[str, Any]:
     """
@@ -2817,31 +2378,32 @@ def create_default_config() -> Dict[str, Any]:
         "max_iterations": 5,
         "min_new_content": 2,
         "min_confidence": 0.7,
-        
         "search_config": {
             "max_queries": 5,
             "min_priority": 0.3,
-            "refinement_threshold": 0.7
+            "refinement_threshold": 0.7,
+            "rate_limit": 20      # Updated: Perplexity rate limit set to 20 requests per minute
         },
-        
         "explore_config": {
             "max_urls": 10,
             "min_priority": 0.3,
             "allowed_domains": []
         },
-        
         "reason_config": {
             "max_parallel_tasks": 3,
             "chunk_size": 30000,
-            "min_priority": 0.3
+            "min_priority": 0.3,
+            "rate_limit": 200,     # Updated: O3 mini rate limit set to 200 requests per minute
+            "flash_fix_rate_limit": 10
         },
-        
         "execute_config": {
             "model": "claude-3-5-sonnet-20241022",
             "min_priority": 0.3,
             "max_retries": 2
-        }
+        },
+        "max_workers": 20
     }
+
 
 def display_results(results: Dict[str, Any]):
     """
@@ -2854,14 +2416,12 @@ def display_results(results: Dict[str, Any]):
         rprint(f"\n[red]Error during research: {results['error']}[/red]")
         return
         
-    # Display paper
     rprint(Panel(
         Markdown(results["paper"]),
         title="[bold green]Research Paper[/bold green]",
         border_style="green"
     ))
     
-    # Display metrics
     metrics = results.get("metrics", {})
     
     rprint("\n[bold cyan]Research Metrics:[/bold cyan]")
@@ -2869,8 +2429,6 @@ def display_results(results: Dict[str, Any]):
     rprint(f"Iterations: {metrics.get('iterations', 0)}")
     rprint(f"Total decisions: {metrics.get('total_decisions', 0)}")
     rprint(f"Total content items: {metrics.get('total_content', 0)}")
-    
-    # Display agent metrics
     agent_metrics = metrics.get("agent_metrics", {})
     for agent_name, agent_data in agent_metrics.items():
         rprint(f"\n[bold]{agent_name.title()} Agent:[/bold]")
@@ -2882,18 +2440,16 @@ def display_results(results: Dict[str, Any]):
             f"{agent_data.get('total_execution_time', 0) / max(agent_data.get('decisions_made', 1), 1):.2f}s"
         )
 
-def main():
+
+async def main_async():
     """Main entry point for the research system."""
-    # Initialize style
     style = Style.from_dict({
         'prompt': 'orange bold',
     })
     session = PromptSession(style=style)
     
-    # Create orchestrator with default config
-    orchestrator = ResearchOrchestrator(create_default_config())
+    manager = ResearchManager(create_default_config())
     
-    # Display welcome message
     rprint(Panel.fit(
         "[bold cyan]RAT Multi-Agent Research System[/bold cyan]\n"
         "Conduct research using a coordinated team of specialized AI agents",
@@ -2908,37 +2464,32 @@ def main():
     rprint(" • Enter your research question to begin\n")
     
     latest_results: Optional[Dict[str, Any]] = None
+    commands = WordCompleter(['quit', 'config', 'metrics'])
     
     while True:
         try:
-            user_input = session.prompt("\nResearch Question: ", style=style).strip()
+            user_input = await session.prompt_async("\nResearch Question: ", completer=commands)
+            user_input = user_input.strip()
             
             if user_input.lower() == 'quit':
                 rprint("\nGoodbye! 👋")
                 break
-                
             elif user_input.lower() == 'config':
                 rprint(Panel(
-                    Markdown(f"```json\n{json.dumps(orchestrator.config, indent=2)}\n```"),
+                    Markdown(f"```json\n{json.dumps(manager.config, indent=2)}\n```"),
                     title="[bold cyan]Current Configuration[/bold cyan]",
                     border_style="cyan"
                 ))
                 continue
-                
             elif user_input.lower() == 'metrics':
                 if latest_results:
                     display_results(latest_results)
                 else:
                     rprint("[yellow]No research has been conducted yet[/yellow]")
                 continue
-                
-            # Conduct research
             rprint(f"\n[bold cyan]Starting research on:[/bold cyan] {user_input}")
-            latest_results = orchestrator.start_research(user_input)
-            
-            # Display results
+            latest_results = await manager.start_research(user_input)
             display_results(latest_results)
-            
         except KeyboardInterrupt:
             continue
         except EOFError:
@@ -2946,8 +2497,14 @@ def main():
         except Exception as e:
             rprint(f"[red]Error: {str(e)}[/red]")
 
+
+def main():
+    """Run the async main function."""
+    asyncio.run(main_async())
+
+
 if __name__ == "__main__":
-    main() 
+    main()
 ```
 
 ## setup.py
@@ -2990,34 +2547,27 @@ setup(
 ```python
 """
 Test script to run the research agent with a sample question.
+Now asynchronous.
 """
 
+import asyncio
 from rat.research.orchestrator import ResearchOrchestrator
 from rich import print as rprint
 
-def main():
-    # Initialize the orchestrator
+async def main():
     orchestrator = ResearchOrchestrator()
-    
-    # Define a test question
     question = "What are the main features and pricing of Billit's accounting software, and how does it compare to competitors in Belgium?"
-    
-    # Run the research
     rprint(f"[bold cyan]Starting research on: {question}[/bold cyan]")
-    results = orchestrator.start_research(question)
-    
-    # Print results
+    results = await orchestrator.start_research(question)
     if "error" in results:
         rprint(f"[red]Error: {results['error']}[/red]")
     else:
         rprint("\n[bold green]Research completed![/bold green]")
         rprint("\n[bold]Results:[/bold]")
         print(results["paper"])
-        
         rprint("\n[bold]Sources:[/bold]")
         for source in results.get("sources", []):
             print(f"- {source}")
-        
         rprint("\n[bold]Metrics:[/bold]")
         metrics = results.get("metrics", {})
         print(f"Total time: {metrics.get('total_time', 0):.2f} seconds")
@@ -3026,6 +2576,6 @@ def main():
         print(f"Total content items: {metrics.get('total_content', 0)}")
 
 if __name__ == "__main__":
-    main() 
+    asyncio.run(main())
 ```
 

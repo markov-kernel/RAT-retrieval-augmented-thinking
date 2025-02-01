@@ -300,3 +300,28 @@ class ResearchContext:
             context.branches[bid] = branch
             
         return context
+
+    def save_to_file(self, file_path: str):
+        """
+        Persist the research context to a JSON file.
+        
+        Args:
+            file_path: Path where the context JSON should be saved.
+        """
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load_from_file(cls, file_path: str) -> 'ResearchContext':
+        """
+        Load a research context from a JSON file.
+        
+        Args:
+            file_path: Path to the JSON file.
+            
+        Returns:
+            An instance of ResearchContext.
+        """
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return cls.from_dict(data)

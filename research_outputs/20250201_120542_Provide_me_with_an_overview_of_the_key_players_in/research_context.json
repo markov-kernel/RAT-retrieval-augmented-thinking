@@ -1,0 +1,79 @@
+{
+  "initial_question": "Provide me with an overview of the key players in Belgium in terms of SME accounting software and e-invoicing. I want you to include pricing and features and fill in the gaps. I want to do market research. Focus specifically on Belgium, we are only interested in accounting software for SME\u2019s in Belgium.",
+  "version": 0,
+  "branches": {
+    "main": {
+      "branch_id": "main",
+      "parent_id": null,
+      "token_count": 1588,
+      "created_at": 1738407942.3541172,
+      "metadata": {},
+      "content_items": [
+        {
+          "id": "b890b78d-0cb3-4a41-8755-15c940c04031",
+          "content_type": "search_result",
+          "content": "To conduct market research on SME accounting software and e-invoicing in Belgium, here's an overview of key players, their features, and pricing where available:\n\n## Key Players in SME Accounting Software\n\n1. **Bizzcontrol**\n   - **Features**: Provides a user-friendly platform for accountants and entrepreneurs to analyze financial data, identify trends, and simulate future scenarios[1].\n   - **Pricing**: Not specified in available sources.\n   - **Notes**: Recently acquired by Visma, indicating a strong presence in the Belgian market.\n\n2. **Dexxter**\n   - **Features**: Offers tools for creating and managing invoices, quotations, expenses, and taxes, ensuring compliance with local regulations[1].\n   - **Pricing**: Not specified in available sources.\n   - **Notes**: Part of Visma-owned Teamleader, expanding its reach to more entrepreneurs in Belgium.\n\n3. **Unifiedpost**\n   - **Features**: Offers solutions for e-invoicing, including integration with Peppol for SMEs through tools like Billtobox[5].\n   - **Pricing**: Not specified in available sources.\n   - **Notes**: Provides scalable solutions for businesses of all sizes.\n\n## E-Invoicing Solutions\n\n1. **Peppol Network**\n   - **Features**: A decentralized network for secure exchange of electronic invoices, mandatory for VAT-registered businesses from 2026[3][5].\n   - **Pricing**: Not applicable as it is a network rather than a software solution.\n   - **Notes**: Businesses must connect to Peppol directly or through third-party providers.\n\n2. **Billtobox**\n   - **Features**: Connects SMEs to Peppol without needing a full ERP system, ensuring compliance with e-invoicing regulations[5].\n   - **Pricing**: Not specified in available sources.\n   - **Notes**: Part of Unifiedpost's offerings for SMEs.\n\n## Market Trends\n\n- **Mandatory E-Invoicing**: From January 1st, 2026, electronic invoicing will be mandatory for businesses subject to VAT obligations in Belgium, driving demand for compliant software solutions[3].\n- **Tax Incentives**: The Belgian government offers tax incentives, such as increased investment allowances and expense deductions, to help SMEs adapt to the new e-invoicing regulations[3].\n\nFor more detailed pricing and specific features, it may be necessary to contact these companies directly or visit their official websites for the most up-to-date information.",
+          "metadata": {
+            "decision_type": "search",
+            "urls": []
+          },
+          "token_count": 587,
+          "priority": 1.0,
+          "timestamp": 1738407956.1705291
+        },
+        {
+          "id": "a70f2c78-94ae-4d38-80a4-ee107e234e95",
+          "content_type": "search_result",
+          "content": "I couldn't find specific pricing details for Bizzcontrol, a Belgium-based SME accounting software, in the provided search results. Bizzcontrol is known for providing a user-friendly platform that enables accountants and entrepreneurs to analyze financial data, identify trends, and simulate future scenarios[1]. For precise pricing information, it would be best to contact Bizzcontrol directly or visit their official website.\n\nIf you're interested in learning more about Bizzcontrol's features or how it integrates with Visma's ecosystem, you can explore Visma's resources on their recent acquisitions and partnerships[1]. However, for detailed pricing, direct contact with the company is recommended.",
+          "metadata": {
+            "decision_type": "search",
+            "urls": []
+          },
+          "token_count": 175,
+          "priority": 0.8,
+          "timestamp": 1738408189.7673118
+        },
+        {
+          "id": "f0773e82-1d13-4516-b0f9-3b81c3711d16",
+          "content_type": "search_result",
+          "content": "Currently, there are no specific pricing details available for Dexxter, a Belgian SME accounting software, in the provided search results. However, it is mentioned that the app offers a **free trial for 30 days** without requiring a credit card[1][3]. For detailed pricing information, it might be necessary to contact Dexxter directly or visit their official website.\n\nHere is a summary of what Dexxter offers:\n\n- **Features**: \n  - Insight into business figures\n  - Sending invoices and quotations\n  - Managing expenses\n  - Tracking tax deadlines\n  - Continuous updates[1][3]\n\n- **Target Audience**: \n  - Belgian sole proprietorships[1][3]\n\n- **Trial Period**: \n  - 30 days free trial[1][3]",
+          "metadata": {
+            "decision_type": "search",
+            "urls": []
+          },
+          "token_count": 173,
+          "priority": 0.8,
+          "timestamp": 1738408193.5102751
+        },
+        {
+          "id": "c83d6216-1926-42fc-8873-ac977fc0666d",
+          "content_type": "search_result",
+          "content": "Currently, specific pricing details for Unifiedpost and Billtobox e-invoicing solutions in Belgium are not readily available in the provided search results. However, here are some key points about their services:\n\n1. **Unifiedpost**:\n   - Unifiedpost offers comprehensive e-invoicing solutions that automate invoice processing, ensuring accuracy and compliance with EU standards like PEPPOL[1][3].\n   - They provide tailored solutions for both sales and purchase invoices, optimizing business operations[3].\n   - For detailed pricing, it is recommended to contact Unifiedpost directly for a customized quote.\n\n2. **Billtobox**:\n   - Billtobox, powered by Unifiedpost Group, simplifies invoice management by automating transactions and connecting businesses with stakeholders[3].\n   - It offers a user-friendly platform for creating and managing electronic invoices, with features like automatic detection of how customers prefer to receive invoices[2].\n   - While specific pricing details are not mentioned, Billtobox allows users to create electronic invoices for free within their account[2].\n\nFor precise pricing information, contacting both Unifiedpost and Billtobox directly would be advisable.",
+          "metadata": {
+            "decision_type": "search",
+            "urls": []
+          },
+          "token_count": 299,
+          "priority": 0.8,
+          "timestamp": 1738408198.355603
+        },
+        {
+          "id": "f8032b2f-b9bf-45c6-9f8f-bf828a65d787",
+          "content_type": "analysis",
+          "content": {
+            "analysis": "The text identifies major providers of accounting software and e-invoicing solutions for Belgian SMEs. It highlights three main software players\u2014Bizzcontrol, Dexxter, and Unifiedpost\u2014each targeting key accounting and compliance needs. Bizzcontrol and Dexxter offer tools for managing invoices, quotations, expenses, and taxes, with their links to Visma suggesting market consolidation. Unifiedpost emphasizes scalable e-invoicing solutions and integration with the Peppol network, particularly through its Billtobox tool that enables SMEs to connect to Peppol without a full ERP system.\n\nPeppol itself is described as a decentralized network for secure electronic invoicing that will become mandatory for VAT-registered businesses from January 1, 2026, positioning it as a central element in the evolving regulatory landscape. This regulatory change, combined with government tax incentives like increased investment allowances and expense deductions, is driving the demand for compliant software solutions.\n\nPricing information for these providers is generally not specified, indicating that detailed cost structures may need to be obtained directly from the companies. Overall, the content suggests that the market is moving toward increased integration with regulatory platforms (such as Peppol), a shift likely accelerated by new legal requirements and supported by industry consolidation and government incentives.",
+            "insights": [],
+            "analyzed_item_id": "b890b78d-0cb3-4a41-8755-15c940c04031"
+          },
+          "metadata": {
+            "decision_type": "reason"
+          },
+          "token_count": 354,
+          "priority": 0.9,
+          "timestamp": 1738408203.030443
+        }
+      ]
+    }
+  },
+  "merged_branches": []
+}

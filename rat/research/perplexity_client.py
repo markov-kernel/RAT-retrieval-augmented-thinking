@@ -1,75 +1,93 @@
 """
 Perplexity API client for web search functionality.
-Uses the Perplexity API to perform intelligent web searches and extract relevant information.
+Now uses async OpenAI API calls.
 """
 
 import os
 import re
 import json
 import logging
-from openai import OpenAI
+import openai
 from typing import List, Dict, Any
 from rich import print as rprint
 from dotenv import load_dotenv
-import httpx
+import asyncio
+from openai import OpenAI
 
 load_dotenv()
-
-# Get API logger
 api_logger = logging.getLogger('api.perplexity')
+
 
 class PerplexityClient:
     def __init__(self):
-        self.client = OpenAI(
-            api_key=os.getenv("PERPLEXITY_API_KEY"),
-            base_url="https://api.perplexity.ai"
-        )
-        
+        self.api_key = os.getenv("PERPLEXITY_API_KEY")
+        self.client = openai
+        self.client.api_key = self.api_key
+        self.client.api_base = "https://api.perplexity.ai"
         self.model = "sonar-pro"
         self.system_message = (
             "You are a research assistant helping to find accurate and up-to-date information. "
             "When providing information, always cite your sources in the format [Source: URL]. "
             "Focus on finding specific, factual information and avoid speculation."
         )
-        
-    def search(self, query: str) -> Dict[str, Any]:
+
+    async def search(self, query: str) -> Dict[str, Any]:
         """
-        Perform a web search using the Perplexity API.
-        
-        Args:
-            query: The search query
-            
-        Returns:
-            Dict containing search results and extracted URLs
+        Perform an asynchronous web search using the Perplexity API via requests.
         """
         api_logger.info(f"Perplexity API Request - Query: {query}")
-        
+        payload = {
+            "model": "sonar-reasoning",
+            "messages": [
+                {"role": "system", "content": self.system_message},
+                {"role": "user", "content": query}
+            ],
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "search_domain_filter": ["perplexity.ai"],
+            "return_images": False,
+            "return_related_questions": False,
+            "search_recency_filter": "month",
+            "top_k": 0,
+            "stream": False,
+            "presence_penalty": 0,
+            "frequency_penalty": 1,
+            "response_format": None
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        url = "https://api.perplexity.ai/chat/completions"
+
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_message},
-                    {"role": "user", "content": query}
-                ],
-                temperature=0.7,
-                stream=False
+            response = await asyncio.to_thread(
+                lambda: __import__('requests').post(url, json=payload, headers=headers)
             )
-            
-            content = response.choices[0].message.content
+            if response.status_code != 200:
+                api_logger.error(f"Perplexity API error: Error code: {response.status_code} - {response.text}")
+                return {
+                    "content": "",
+                    "urls": [],
+                    "query": query,
+                    "metadata": {}
+                }
+
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
             urls = self._extract_urls(content)
-            
             api_logger.debug(f"Response data: {json.dumps({'content': content, 'urls': urls}, indent=2)}")
-            
             return {
                 "content": content,
                 "urls": urls,
                 "query": query,
                 "metadata": {
-                    "model": self.model,
-                    "usage": response.usage
+                    "model": "sonar",
+                    "usage": data.get("usage", {})
                 }
             }
-            
         except Exception as e:
             api_logger.error(f"Perplexity API error: {str(e)}")
             return {
@@ -78,45 +96,22 @@ class PerplexityClient:
                 "query": query,
                 "metadata": {}
             }
-            
+
     def _extract_urls(self, text: str) -> List[str]:
-        """
-        Extract URLs from text, including those in citation format.
-        
-        Args:
-            text: Text to extract URLs from
-            
-        Returns:
-            List of extracted URLs
-        """
-        # Look for URLs in citation format [Source: URL]
-        citation_pattern = r'\[Source: (https?://[^\]]+)\]'
+        citation_pattern = r'$begin:math:display$Source: (https?://[^$end:math:display$]+)\]'
         citation_urls = re.findall(citation_pattern, text)
-        
-        # Also look for raw URLs
         url_pattern = r'https?://\S+'
         raw_urls = re.findall(url_pattern, text)
-        
-        # Combine and deduplicate URLs
         all_urls = list(set(citation_urls + raw_urls))
         return all_urls
 
-    def validate_url(self, url: str) -> bool:
-        """
-        Validate if a URL is accessible and safe to scrape.
-        """
+    async def validate_url(self, url: str) -> bool:
         import requests
         from urllib.parse import urlparse
-        
         try:
-            # Parse URL
             parsed = urlparse(url)
             if not all([parsed.scheme, parsed.netloc]):
                 return False
-                
-            # Check if URL is accessible
-            response = requests.head(url, timeout=5)
-            return response.status_code == 200
-            
+            return await asyncio.to_thread(lambda: requests.head(url, timeout=5).status_code == 200)
         except Exception:
-            return False 
+            return False
